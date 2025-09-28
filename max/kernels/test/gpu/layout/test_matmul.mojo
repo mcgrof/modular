@@ -16,6 +16,7 @@ from sys.info import (
     _has_gpu_bf16_fma,
     _has_gpu_fp32_tensor_cores,
     _has_gpu_tensor_cores,
+    _is_amd_rdna,
 )
 
 from benchmark import Bench
@@ -155,6 +156,55 @@ struct test_matmul[
         )
 
 
+fn run_rdna_tensor_core_tests[
+    a_layout: Layout,
+    b_layout: Layout,
+    c_layout: Layout,
+](mut m: Bench, ctx: DeviceContext) raises:
+    """Run FP16 WMMA tensor core tests for RDNA3+ GPUs.
+
+    Tests FP16×FP16+FP32→FP32 accumulation using RDNA WMMA intrinsics.
+
+    RDNA WMMA Configuration:
+        - MMA dimensions: 16×16×16 (M×N×K)
+        - Block sizes: 64×64×32 (BM×BN×BK)
+        - Warp tile sizes: 32×32 (WM×WN)
+        - Input type: FP16
+        - Accumulator type: FP32
+
+    Args:
+        a_layout: Memory layout for matrix A
+        b_layout: Memory layout for matrix B
+        c_layout: Memory layout for matrix C
+        m: Benchmark harness
+        ctx: Device context for GPU operations
+    """
+    var test_tc_rdna = test_matmul[
+        DType.float16, a_layout, b_layout, c_layout, True
+    ](m, ctx)
+
+    alias MMA_M = 16
+    alias MMA_N = 16
+    alias MMA_K = 16
+
+    alias k_tc_rdna = run_gemm_kernel_tc[
+        DType.float16,
+        a_layout,
+        b_layout,
+        c_layout,
+        64,
+        64,
+        32,
+        32,
+        32,
+        MMA_M,
+        MMA_N,
+        MMA_K,
+    ]
+
+    test_tc_rdna.run_test[k_tc_rdna](m)
+
+
 def main():
     alias N = 4096
     alias M = N
@@ -200,7 +250,9 @@ def main():
 
         alias MMA_M = 16
         alias MMA_N = 8 if has_nvidia_gpu_accelerator() else 16
-        alias MMA_K = 8 if has_nvidia_gpu_accelerator() else 4
+        alias MMA_K = 8 if has_nvidia_gpu_accelerator() else (
+            16 if _is_amd_rdna() else 4
+        )
 
         alias k_tc = run_gemm_kernel_tc[
             DType.float32,
@@ -223,6 +275,10 @@ def main():
         test.run_test[k4](m)
         test.run_test[k5](m)
         test.run_test[k6](m)
+
+        @parameter
+        if _is_amd_rdna():
+            run_rdna_tensor_core_tests[a_layout, b_layout, c_layout](m, ctx)
 
         @parameter
         if _has_gpu_bf16_fma():
