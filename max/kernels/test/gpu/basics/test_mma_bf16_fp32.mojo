@@ -15,7 +15,10 @@
 from gpu import thread_idx
 from gpu.host import DeviceContext
 from gpu.mma import mma
-from gpu.mma_util import load_matrix_a_amd_rdna16x16x16, load_matrix_b_amd_rdna16x16x16
+from gpu.compute.arch.mma_amd_rdna import (
+    load_matrix_a_amd_rdna16x16x16,
+    load_matrix_b_amd_rdna16x16x16,
+)
 from testing import assert_equal
 
 
