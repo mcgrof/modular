@@ -11,7 +11,11 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 from math import ceildiv
-from sys.info import simd_width_of
+from sys import has_amd_gpu_accelerator
+from sys.info import (
+    _is_amd_rdna,
+    simd_width_of,
+)
 
 import linalg.matmul.vendor.blas as vendor_blas
 from benchmark import Bench, Bencher, BenchId, BenchMetric, ThroughputMeasure
@@ -1144,11 +1148,13 @@ fn matmul_kernel_tc[
         address_space = AddressSpace.SHARED,
     ].stack_allocation()
 
-    # Allocate register tile for accumulating partial results
+    alias regs_per_thread = 8 if (
+        _is_amd_rdna() and dtype is DType.float32
+    ) else 4
     c_reg = (
         LayoutTensor[
             C.dtype,
-            Layout.row_major(WM // MMA_M, (WN * 4) // MMA_N),
+            Layout.row_major(WM // MMA_M, (WN * regs_per_thread) // MMA_N),
             MutableAnyOrigin,
             address_space = AddressSpace.LOCAL,
         ]
@@ -1189,7 +1195,7 @@ fn matmul_kernel_tc[
                 @parameter
                 for mma_n in range(WN // MMA_N):
                     # Get the register tile for the current MMA operation
-                    c_reg_m_n = c_reg.tile[1, 4](mma_m, mma_n)
+                    c_reg_m_n = c_reg.tile[1, regs_per_thread](mma_m, mma_n)
 
                     # Get the MMA tiles of A and B
                     A_mma_tile = A_warp_tile.tile[MMA_M, MMA_K](mma_m, mma_k)
@@ -1216,7 +1222,7 @@ fn matmul_kernel_tc[
         @parameter
         for mma_n in range(WN // MMA_N):
             var C_mma_tile = C_warp_tile.tile[MMA_M, MMA_N](mma_m, mma_n)
-            var c_reg_m_n = c_reg.tile[1, 4](mma_m, mma_n)
+            var c_reg_m_n = c_reg.tile[1, regs_per_thread](mma_m, mma_n)
             mma_op.store_d(C_mma_tile, c_reg_m_n)
 
 
