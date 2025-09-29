@@ -15,6 +15,8 @@ from collections import OptionalReg
 from math import align_up, ceildiv, gcd
 from sys import align_of, size_of
 from sys.info import (
+    _is_amd_cdna,
+    _is_amd_rdna,
     has_amd_gpu_accelerator,
     has_nvidia_gpu_accelerator,
     is_amd_gpu,
@@ -51,6 +53,7 @@ from .matmul.cpu.impl import _submatmul_sequential_sync
 from .matmul.gpu import _matmul_gpu
 from .matmul.gpu._multistage_gemm_gpu import multistage_gemm_kernel
 from .matmul.gpu.amd import gemm_kernel_amd
+from .matmul.gpu.rdna import gemm_kernel_rdna
 from .matmul.gpu.sm100.blockwise_fp8 import (
     matmul_sm100_blockwise_scaled_fp8_1d2d_kernel,
 )
@@ -738,8 +741,28 @@ fn batched_matmul_kernel_gpu[
                 elementwise_epilogue_fn_wrapper
             ) if elementwise_lambda_fn else None,
         ](c, a, b)
-    elif is_amd_gpu():
+    elif _is_amd_cdna():
         gemm_kernel_amd[
+            c_type,
+            c.layout,
+            a_type,
+            a.layout,
+            b_type,
+            b.layout,
+            transpose_b,
+            c.layout_int_type,
+            a.layout_int_type,
+            b.layout_int_type,
+            c.linear_idx_type,
+            a.linear_idx_type,
+            b.linear_idx_type,
+            config,
+            OptionalReg[matmul_elementwise_epilogue_type](
+                elementwise_epilogue_fn_wrapper
+            ) if elementwise_lambda_fn else None,
+        ](c, a, b)
+    elif _is_amd_rdna():
+        gemm_kernel_rdna[
             c_type,
             c.layout,
             a_type,
@@ -895,7 +918,7 @@ fn _batched_matmul_gpu[
                 kernels.ampere_128x128_4.shared_mem_usage()
             ),
         )
-    elif has_static_NK and has_amd_gpu_accelerator() and transpose_b:
+    elif has_static_NK and _is_amd_cdna() and transpose_b:
 
         @always_inline
         @parameter
@@ -954,7 +977,67 @@ fn _batched_matmul_gpu[
             kernel_helper[128, 64]()
         else:
             kernel_helper[128, 128]()
+    elif has_static_NK and _is_amd_rdna() and transpose_b:
 
+        @always_inline
+        @parameter
+        fn rdna_kernel_helper[
+            block_m: Int,
+            block_n: Int,
+            *,
+            num_k_partitions: Int = 1,
+            num_pipeline_stages: Int = 1,
+        ]() raises:
+            alias block_k = 32
+            alias config = MatmulConfig[a_type, b_type, c_type, transpose_b](
+                block_tile_shape=Index(block_m, block_n, block_k),
+                warp_tile_shape=Index(16, 16, 16),  # RDNA WMMA tile size
+                num_pipeline_stages=1,
+                num_k_partitions=1,
+            )
+
+            alias batched_matmul_type = batched_matmul_kernel_gpu[
+                c_tensor_reshaped.dtype,
+                a_tensor_reshaped.dtype,
+                b_tensor_reshaped.dtype,
+                c_tensor_reshaped.layout,
+                a_tensor_reshaped.layout,
+                b_tensor_reshaped.layout,
+                transpose_b,
+                config,
+                elementwise_epilogue_fn,
+            ]
+
+            ctx.enqueue_function_checked[
+                batched_matmul_type, batched_matmul_type
+            ](
+                c_tensor_reshaped,
+                a_tensor_reshaped,
+                b_tensor_reshaped,
+                m,
+                n,
+                k,
+                grid_dim=(
+                    ceildiv(n, block_n),
+                    ceildiv(m, block_m),
+                    batch_size,
+                ),
+                block_dim=(128, 1, 1),  # 4 warps per block for RDNA
+            )
+
+        # DeepSeek size tuning adapted for RDNA (tile sizes must be multiples of 16)
+        if m == 256 and n == 128 and k == 512:
+            rdna_kernel_helper[128, 64]()  # Skinny shape: reduce N tiles
+        elif m == 256 and n == 512 and k == 128:
+            rdna_kernel_helper[64, 64]()  # Balanced for this shape
+        elif m == 14 and n == 3072 and k == 12288:
+            rdna_kernel_helper[
+                32, 32
+            ]()  # Small M: use small tiles to reduce waste
+        elif m == 600 and n == 18256 and k == 4096:
+            rdna_kernel_helper[128, 64]()  # Large N: reduce tile height
+        else:
+            rdna_kernel_helper[64, 64]()  # Default for RDNA
     else:
         # TODO: support non-A100 transposed kernels
         constrained[
