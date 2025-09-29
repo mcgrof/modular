@@ -16,6 +16,8 @@ from sys.info import (
     _has_gpu_bf16_fma,
     _has_gpu_fp32_tensor_cores,
     _has_gpu_tensor_cores,
+    _is_amd_cdna,
+    _is_amd_rdna,
 )
 
 from benchmark import Bench
@@ -101,16 +103,19 @@ struct test_matmul[
         ctx.enqueue_copy(self.b_device_buffer, self.b_host.tensor.data)
         ctx.enqueue_memset(self.c_device_buffer_ref, 0)
 
-        run_cublas[dtype, enable_tc](
-            m,
-            ctx,
-            self.M,
-            self.N,
-            self.K,
-            self.a_device_buffer.unsafe_ptr(),
-            self.b_device_buffer.unsafe_ptr(),
-            self.c_device_buffer_ref.unsafe_ptr(),
-        )
+        # Skip hipblaslt comparison on RDNA (missing libraries)
+        @parameter
+        if not _is_amd_rdna():
+            run_cublas[dtype, enable_tc](
+                m,
+                ctx,
+                self.M,
+                self.N,
+                self.K,
+                self.a_device_buffer.unsafe_ptr(),
+                self.b_device_buffer.unsafe_ptr(),
+                self.c_device_buffer_ref.unsafe_ptr(),
+            )
 
         ctx.enqueue_copy(self.c_host_ref.tensor.data, self.c_device_buffer_ref)
 
@@ -147,12 +152,16 @@ struct test_matmul[
         gemm(m, ctx, a, b, c)
 
         ctx.enqueue_copy(self.c_host.tensor.data, self.c_device_buffer)
-        assert_almost_equal(
-            self.c_host_ref.tensor,
-            self.c_host.tensor,
-            atol=0.0001,
-            rtol=0.01,
-        )
+
+        # Only compare with reference if we ran cublas/hipblaslt
+        @parameter
+        if not _is_amd_rdna():
+            assert_almost_equal(
+                self.c_host_ref.tensor,
+                self.c_host.tensor,
+                atol=0.0001,
+                rtol=0.01,
+            )
 
 
 def main():
@@ -168,10 +177,6 @@ def main():
 
         var test = test_matmul[
             DType.float32, a_layout, b_layout, c_layout, False
-        ](m, ctx)
-
-        var test_tc = test_matmul[
-            DType.float32, a_layout, b_layout, c_layout, True
         ](m, ctx)
 
         alias k1 = run_gemm_kernel_1[
@@ -198,31 +203,43 @@ def main():
             DType.float32, a_layout, b_layout, c_layout, 128, 128, 8, 8, 8
         ]
 
-        alias MMA_M = 16
-        alias MMA_N = 8 if has_nvidia_gpu_accelerator() else 16
-        alias MMA_K = 8 if has_nvidia_gpu_accelerator() else 4
-
-        alias k_tc = run_gemm_kernel_tc[
-            DType.float32,
-            a_layout,
-            b_layout,
-            c_layout,
-            64,  # BM: The block size in the M dimension
-            64,  # BN: The block size in the N dimension
-            32,  # BK: The block size in the K dimension
-            32,  # WM: The warp tile size in the M dimension
-            32,  # WN: The warp tile size in the N dimension
-            MMA_M,  # MMA_M: Tensor core instruction shape in M dimension
-            MMA_N,  # MMA_N: Tensor core instruction shape in N dimension
-            MMA_K,  # MMA_K: Tensor core instruction shape in K dimension
-        ]
-
         test.run_test[k1](m)
         test.run_test[k2](m)
         test.run_test[k3](m)
         test.run_test[k4](m)
         test.run_test[k5](m)
         test.run_test[k6](m)
+
+        # Skip tensor core tests on RDNA (no float32 MMA support)
+        @parameter
+        if not _is_amd_rdna():
+            var test_tc = test_matmul[
+                DType.float32, a_layout, b_layout, c_layout, True
+            ](m, ctx)
+
+            # MMA dimensions: NVIDIA (16x8x8), CDNA (16x16x4), RDNA WMMA (16x16x16)
+            alias MMA_M = 16
+            alias MMA_N = 8 if has_nvidia_gpu_accelerator() else 16
+            alias MMA_K = 8 if has_nvidia_gpu_accelerator() else (
+                4 if _is_amd_cdna() else 16
+            )
+
+            alias k_tc = run_gemm_kernel_tc[
+                DType.float32,
+                a_layout,
+                b_layout,
+                c_layout,
+                64,  # BM: The block size in the M dimension
+                64,  # BN: The block size in the N dimension
+                32,  # BK: The block size in the K dimension
+                32,  # WM: The warp tile size in the M dimension
+                32,  # WN: The warp tile size in the N dimension
+                MMA_M,  # MMA_M: Tensor core instruction shape in M dimension
+                MMA_N,  # MMA_N: Tensor core instruction shape in N dimension
+                MMA_K,  # MMA_K: Tensor core instruction shape in K dimension
+            ]
+
+            test_tc.run_test[k_tc](m)
 
         @parameter
         if _has_gpu_bf16_fma():

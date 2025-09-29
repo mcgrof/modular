@@ -11,7 +11,13 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 from math import ceildiv
-from sys.info import simd_width_of
+from sys import has_amd_gpu_accelerator
+from sys.info import (
+    _has_gpu_tensor_cores,
+    _is_amd_cdna,
+    _is_amd_rdna,
+    simd_width_of,
+)
 
 import linalg.matmul.vendor.blas as vendor_blas
 from benchmark import Bench, Bencher, BenchId, BenchMetric, ThroughputMeasure
@@ -152,27 +158,54 @@ fn gemm_kernel_1[
     # Calculate the column and row indices for each thread.
     var col = thread_idx.y
     var row = thread_idx.x
-    var bidx = block_idx.x
-    var bidy = block_idx.y
+    var bidx = Int(block_idx.x)
+    var bidy = Int(block_idx.y)
 
     # Get the tile of the output matrix C that this thread is
     # responsible for computing.
     var dst = c.tile[BM, BN](bidy, bidx)
 
     # Initialize a register to accumulate the result for this thread.
-    var dst_reg: c.element_type = 0
+    @parameter
+    if (
+        dtype == DType.bfloat16
+        and has_amd_gpu_accelerator()
+        and not _has_gpu_tensor_cores()
+    ):
+        var dst_reg: Float32 = 0
 
-    # Iterate over the K dimension to compute the dot product.
-    for k in range(b.dim[0]()):
-        # Get the corresponding tiles from matrices A and B.
-        var a_tile = a.tile[BM, 1](bidy, k)
-        var b_tile = b.tile[1, BN](k, bidx)
+        # Iterate over the K dimension to compute the dot product.
+        for k in range(b.dim[0]()):
+            # Get the corresponding tiles from matrices A and B.
+            var a_tile = a.tile[BM, 1](bidy, k)
+            var b_tile = b.tile[1, BN](k, bidx)
 
-        # Multiply the elements and accumulate the result.
-        dst_reg += a_tile[row, 0] * b_tile[0, col]
+            # Emulate BF16 FMA: promote to FP32, compute, convert back
+            # Rebind layout tensor elements to scalars for arithmetic
+            var a_val = rebind[Scalar[DType.float32]](
+                a_tile[row, 0].cast[DType.float32]()
+            )
+            var b_val = rebind[Scalar[DType.float32]](
+                b_tile[0, col].cast[DType.float32]()
+            )
+            dst_reg += a_val * b_val
 
-    # Write the final accumulated result to the output matrix.
-    dst[row, col] += dst_reg
+        # Convert FP32 result back to BF16 and write to output
+        dst[row, col] += dst_reg.cast[dtype]()
+    else:
+        var dst_reg: c.element_type = 0
+
+        # Iterate over the K dimension to compute the dot product.
+        for k in range(b.dim[0]()):
+            # Get the corresponding tiles from matrices A and B.
+            var a_tile = a.tile[BM, 1](bidy, k)
+            var b_tile = b.tile[1, BN](k, bidx)
+
+            # Multiply the elements and accumulate the result.
+            dst_reg += a_tile[row, 0] * b_tile[0, col]
+
+        # Write the final accumulated result to the output matrix.
+        dst[row, col] += dst_reg
 
 
 fn run_gemm_kernel_1[
@@ -274,8 +307,8 @@ fn gemm_kernel_2[
 
     var col = thread_idx.x
     var row = thread_idx.y
-    var bidx = block_idx.x
-    var bidy = block_idx.y
+    var bidx = Int(block_idx.x)
+    var bidy = Int(block_idx.y)
 
     # Get the tile of the output matrix C
     var dst = c.tile[BM, BN](bidy, bidx)
@@ -396,11 +429,11 @@ fn gemm_kernel_3[
     number of rows in B.
     """
     # Calculate the column and row indices for each thread
-    var col = thread_idx.x % UInt(BN)
-    var row = thread_idx.x // UInt(BN)
+    var col = Int(thread_idx.x % UInt(BN))
+    var row = Int(thread_idx.x // UInt(BN))
 
     # Get the tile of the output matrix C that this thread block is responsible for
-    var dst = c.tile[BM, BN](block_idx.y, block_idx.x)
+    var dst = c.tile[BM, BN](Int(block_idx.y), Int(block_idx.x))
 
     # Allocate shared memory for tiles of input matrices A and B
     var a_smem = LayoutTensor[
@@ -426,8 +459,8 @@ fn gemm_kernel_3[
         alias load_b_layout = Layout.row_major(BK, NUM_THREADS // BK)
 
         # Get the tiles of A and B for the current iteration
-        var a_tile = a.tile[BM, BK](block_idx.y, block)
-        var b_tile = b.tile[BK, BN](block, block_idx.x)
+        var a_tile = a.tile[BM, BK](Int(block_idx.y), block)
+        var b_tile = b.tile[BK, BN](block, Int(block_idx.x))
 
         # Asynchronously copy tiles of A and B from global memory to shared memory
         copy_dram_to_sram_async[thread_layout=load_a_layout](a_smem, a_tile)
@@ -557,10 +590,10 @@ fn gemm_kernel_4[
     of rows in B.
     """
     # Calculate the column and row indices for each thread.
-    var col = thread_idx.x % UInt(BN)
-    var row = thread_idx.x // UInt(BN)
-    var bidx = block_idx.x
-    var bidy = block_idx.y
+    var col = Int(thread_idx.x % UInt(BN))
+    var row = Int(thread_idx.x // UInt(BN))
+    var bidx = Int(block_idx.x)
+    var bidy = Int(block_idx.y)
 
     # Get the tile of the output matrix C that this thread is
     # responsible for computing.
@@ -594,8 +627,8 @@ fn gemm_kernel_4[
         alias load_b_layout = Layout.row_major(BK, NUM_THREADS // BK)
 
         # Get the tiles of A and B for the current block.
-        var a_tile = a.tile[BM, BK](block_idx.y, block)
-        var b_tile = b.tile[BK, BN](block, block_idx.x)
+        var a_tile = a.tile[BM, BK](Int(block_idx.y), block)
+        var b_tile = b.tile[BK, BN](block, Int(block_idx.x))
 
         # Load the tiles of A and B into shared memory asynchronously.
         copy_dram_to_sram_async[thread_layout=load_a_layout](a_smem, a_tile)
@@ -735,10 +768,10 @@ fn gemm_kernel_5[
     matrix multiplication, i.e., the number of columns in A equals the number
     of rows in B.
     """
-    var partition_col = thread_idx.x % UInt(BN // TN)
-    var partition_row = thread_idx.x // UInt(BN // TN)
-    var bidx = block_idx.x
-    var bidy = block_idx.y
+    var partition_col = Int(thread_idx.x % UInt(BN // TN))
+    var partition_row = Int(thread_idx.x // UInt(BN // TN))
+    var bidx = Int(block_idx.x)
+    var bidy = Int(block_idx.y)
 
     var dst = c.tile[BM, BN](bidy, bidx).tile[TM, TN](
         partition_row, partition_col
@@ -776,8 +809,8 @@ fn gemm_kernel_5[
     for block in range(ntiles):
         alias load_a_layout = Layout.row_major(NUM_THREADS // BK, BK)
         alias load_b_layout = Layout.row_major(BK, NUM_THREADS // BK)
-        var a_tile = a.tile[BM, BK](block_idx.y, block)
-        var b_tile = b.tile[BK, BN](block, block_idx.x)
+        var a_tile = a.tile[BM, BK](Int(block_idx.y), block)
+        var b_tile = b.tile[BK, BN](block, Int(block_idx.x))
         copy_dram_to_sram_async[thread_layout=load_a_layout](a_smem, a_tile)
         copy_dram_to_sram_async[thread_layout=load_b_layout](b_smem, b_tile)
 
@@ -911,10 +944,10 @@ fn gemm_kernel_6[
     """
 
     alias simd_width = simd_width_of[dtype]()
-    var partition_col = thread_idx.x % UInt(BN // TN)
-    var partition_row = thread_idx.x // UInt(BN // TN)
-    var bidx = block_idx.x
-    var bidy = block_idx.y
+    var partition_col = Int(thread_idx.x % UInt(BN // TN))
+    var partition_row = Int(thread_idx.x // UInt(BN // TN))
+    var bidx = Int(block_idx.x)
+    var bidy = Int(block_idx.y)
 
     # Get the tile of the output matrix C that this thread is responsible
     # for computing.
@@ -961,8 +994,8 @@ fn gemm_kernel_6[
     for block in range(ntiles):
         alias load_a_layout = Layout.row_major(NUM_THREADS // BK, BK)
         alias load_b_layout = Layout.row_major(BK, NUM_THREADS // BK)
-        var a_tile = a.tile[BM, BK](block_idx.y, block)
-        var b_tile = b.tile[BK, BN](block, block_idx.x)
+        var a_tile = a.tile[BM, BK](Int(block_idx.y), block)
+        var b_tile = b.tile[BK, BN](block, Int(block_idx.x))
 
         # Load the tiles of A and B into shared memory using vectorized
         # memory access.
@@ -1113,11 +1146,11 @@ fn matmul_kernel_tc[
     var warp_id = get_warp_id()  # Warp ID within the block
 
     # Calculate warp tile coordinates within the block
-    warp_y = warp_id // UInt(BN // WN)
-    warp_x = warp_id % UInt(BN // WN)
+    warp_y = Int(warp_id // UInt(BN // WN))
+    warp_x = Int(warp_id % UInt(BN // WN))
 
     # Get the warp tile of the output matrix C
-    C_warp_tile = C.tile[BM, BN](block_idx.y, block_idx.x).tile[WM, WN](
+    C_warp_tile = C.tile[BM, BN](Int(block_idx.y), Int(block_idx.x)).tile[WM, WN](
         warp_y, warp_x
     )
 
@@ -1145,10 +1178,16 @@ fn matmul_kernel_tc[
     ].stack_allocation()
 
     # Allocate register tile for accumulating partial results
+    # RDNA float16/bfloat16: 4 registers per thread for 16x16x16 WMMA
+    # RDNA float32: 8 registers per thread (but RDNA doesn't support float32 TC)
+    # CDNA/NVIDIA: 4 registers per thread
+    alias regs_per_thread = 8 if (
+        _is_amd_rdna() and dtype is DType.float32
+    ) else 4
     c_reg = (
         LayoutTensor[
             C.dtype,
-            Layout.row_major(WM // MMA_M, (WN * 4) // MMA_N),
+            Layout.row_major(WM // MMA_M, (WN * regs_per_thread) // MMA_N),
             MutableAnyOrigin,
             address_space = AddressSpace.LOCAL,
         ]
@@ -1161,8 +1200,8 @@ fn matmul_kernel_tc[
         barrier()  # Synchronize before loading new tiles
 
         # Get the tiles of A and B for the current iteration
-        A_dram_tile = A.tile[BM, BK](block_idx.y, k_i)
-        B_dram_tile = B.tile[BK, BN](k_i, block_idx.x)
+        A_dram_tile = A.tile[BM, BK](Int(block_idx.y), k_i)
+        B_dram_tile = B.tile[BK, BN](k_i, Int(block_idx.x))
 
         # Load tiles of A and B into shared memory asynchronously
         copy_dram_to_sram_async[thread_layout = Layout.row_major(4, 8)](
@@ -1189,7 +1228,7 @@ fn matmul_kernel_tc[
                 @parameter
                 for mma_n in range(WN // MMA_N):
                     # Get the register tile for the current MMA operation
-                    c_reg_m_n = c_reg.tile[1, 4](mma_m, mma_n)
+                    c_reg_m_n = c_reg.tile[1, regs_per_thread](mma_m, mma_n)
 
                     # Get the MMA tiles of A and B
                     A_mma_tile = A_warp_tile.tile[MMA_M, MMA_K](mma_m, mma_k)
@@ -1216,7 +1255,7 @@ fn matmul_kernel_tc[
         @parameter
         for mma_n in range(WN // MMA_N):
             var C_mma_tile = C_warp_tile.tile[MMA_M, MMA_N](mma_m, mma_n)
-            var c_reg_m_n = c_reg.tile[1, 4](mma_m, mma_n)
+            var c_reg_m_n = c_reg.tile[1, regs_per_thread](mma_m, mma_n)
             mma_op.store_d(C_mma_tile, c_reg_m_n)
 
 
