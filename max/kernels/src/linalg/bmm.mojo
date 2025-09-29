@@ -15,6 +15,8 @@ from collections import OptionalReg
 from math import align_up, ceildiv, gcd
 from sys import align_of, size_of
 from sys.info import (
+    _is_amd_cdna,
+    _is_amd_rdna,
     has_amd_gpu_accelerator,
     has_nvidia_gpu_accelerator,
     is_amd_gpu,
@@ -51,6 +53,7 @@ from .matmul.cpu.impl import _submatmul_sequential_sync
 from .matmul.gpu import _matmul_gpu
 from .matmul.gpu._multistage_gemm_gpu import multistage_gemm_kernel
 from .matmul.gpu.amd import gemm_kernel_amd
+from .matmul.gpu.rdna import gemm_kernel_rdna
 from .matmul.gpu.sm100.blockwise_fp8 import (
     matmul_sm100_blockwise_scaled_fp8_1d2d_kernel,
 )
@@ -676,9 +679,9 @@ fn batched_matmul_kernel_gpu[
     n: Int,
     k: Int,
 ):
-    var a_ptr = a_tensor.ptr + block_idx.z * UInt(m * k)
-    var b_ptr = b_tensor.ptr + block_idx.z * UInt(n * k)
-    var c_ptr = c_tensor.ptr + block_idx.z * UInt(m * n)
+    var a_ptr = a_tensor.ptr + UInt(block_idx.z * (UInt(m) * UInt(k)))
+    var b_ptr = b_tensor.ptr + UInt(block_idx.z * (UInt(n) * UInt(k)))
+    var c_ptr = c_tensor.ptr + UInt(block_idx.z * (UInt(m) * UInt(n)))
 
     alias static_n = b_tensor.shape[1]() if transpose_b else b_tensor.shape[2]()
     alias static_k = b_tensor.shape[2]() if transpose_b else b_tensor.shape[1]()
@@ -738,8 +741,28 @@ fn batched_matmul_kernel_gpu[
                 elementwise_epilogue_fn_wrapper
             ) if elementwise_lambda_fn else None,
         ](c, a, b)
-    elif is_amd_gpu():
+    elif _is_amd_cdna():
         gemm_kernel_amd[
+            c_type,
+            c.layout,
+            a_type,
+            a.layout,
+            b_type,
+            b.layout,
+            transpose_b,
+            c.layout_int_type,
+            a.layout_int_type,
+            b.layout_int_type,
+            c.linear_idx_type,
+            a.linear_idx_type,
+            b.linear_idx_type,
+            config,
+            OptionalReg[matmul_elementwise_epilogue_type](
+                elementwise_epilogue_fn_wrapper
+            ) if elementwise_lambda_fn else None,
+        ](c, a, b)
+    elif _is_amd_rdna():
+        gemm_kernel_rdna[
             c_type,
             c.layout,
             a_type,
@@ -799,9 +822,6 @@ fn _batched_matmul_gpu[
     var m = c_tensor_reshaped.dim(1)
     var n = c_tensor_reshaped.dim(2)
     var k = a_tensor_reshaped.dim(2)
-
-    if batch_size == 0 or m == 0 or n == 0 or k == 0:
-        return
 
     alias has_static_NK = b_tensor_reshaped.shape[
         1
@@ -895,66 +915,79 @@ fn _batched_matmul_gpu[
                 kernels.ampere_128x128_4.shared_mem_usage()
             ),
         )
-    elif has_static_NK and has_amd_gpu_accelerator() and transpose_b:
+    elif has_static_NK and _is_amd_cdna() and transpose_b:
+        alias block_m = 128
+        alias block_n = 128
+        alias block_k = 64
+        alias config = MatmulConfig[a_type, b_type, c_type, transpose_b](
+            block_tile_shape=Index(block_m, block_n, block_k),
+            warp_tile_shape=Index(block_m // 2, block_n // 2, block_k),
+            num_pipeline_stages=1,
+            num_k_partitions=1,
+        )
+        alias batched_matmul_type = batched_matmul_kernel_gpu[
+            c_tensor_reshaped.dtype,
+            a_tensor_reshaped.dtype,
+            b_tensor_reshaped.dtype,
+            c_tensor_reshaped.layout,
+            a_tensor_reshaped.layout,
+            b_tensor_reshaped.layout,
+            transpose_b,
+            config,
+            elementwise_epilogue_fn,
+        ]
 
-        @always_inline
-        @parameter
-        fn kernel_helper[
-            block_m: Int,
-            block_n: Int,
-            *,
-            num_k_partitions: Int = 1,
-            num_pipeline_stages: Int = 1,
-        ]() raises:
-            alias block_k = 64
-            alias config = MatmulConfig[a_type, b_type, c_type, transpose_b](
-                block_tile_shape=Index(block_m, block_n, block_k),
-                warp_tile_shape=Index(block_m // 2, block_n // 2, block_k),
-                num_pipeline_stages=1,
-                num_k_partitions=1,
-            )
+        ctx.enqueue_function_checked[batched_matmul_type, batched_matmul_type](
+            c_tensor_reshaped,
+            a_tensor_reshaped,
+            b_tensor_reshaped,
+            m,
+            n,
+            k,
+            grid_dim=(
+                ceildiv(n, block_n),
+                ceildiv(m, block_m),
+                batch_size,
+            ),
+            block_dim=(256, 1, 1),
+        )
+    elif has_static_NK and _is_amd_rdna():
+        # RDNA configuration for 16x16x16 WMMA operations
+        alias block_m = 64
+        alias block_n = 64
+        alias block_k = 32
+        alias config = MatmulConfig[a_type, b_type, c_type, transpose_b](
+            block_tile_shape=Index(block_m, block_n, block_k),
+            warp_tile_shape=Index(16, 16, 16),  # RDNA WMMA tile size
+            num_pipeline_stages=1,
+            num_k_partitions=1,
+        )
+        alias batched_matmul_type = batched_matmul_kernel_gpu[
+            c_tensor_reshaped.dtype,
+            a_tensor_reshaped.dtype,
+            b_tensor_reshaped.dtype,
+            c_tensor_reshaped.layout,
+            a_tensor_reshaped.layout,
+            b_tensor_reshaped.layout,
+            transpose_b,
+            config,
+            elementwise_epilogue_fn,
+        ]
 
-            alias batched_matmul_type = batched_matmul_kernel_gpu[
-                c_tensor_reshaped.dtype,
-                a_tensor_reshaped.dtype,
-                b_tensor_reshaped.dtype,
-                c_tensor_reshaped.layout,
-                a_tensor_reshaped.layout,
-                b_tensor_reshaped.layout,
-                transpose_b,
-                config,
-                elementwise_epilogue_fn,
-            ]
-
-            ctx.enqueue_function_checked[
-                batched_matmul_type, batched_matmul_type
-            ](
-                c_tensor_reshaped,
-                a_tensor_reshaped,
-                b_tensor_reshaped,
-                m,
-                n,
-                k,
-                grid_dim=(
-                    ceildiv(n, block_n),
-                    ceildiv(m, block_m),
-                    batch_size,
-                ),
-                block_dim=(256, 1, 1),
-            )
-
-        # DeepSeek size tuning
-        if m == 256 and n == 128 and k == 512:
-            kernel_helper[128, 64]()
-        elif m == 256 and n == 512 and k == 128:
-            kernel_helper[64, 64]()
-        elif m == 14 and n == 3072 and k == 12288:
-            kernel_helper[32, 32]()
-        elif m == 600 and n == 18256 and k == 4096:
-            kernel_helper[128, 64]()
-        else:
-            kernel_helper[128, 128]()
-
+        ctx.enqueue_function[batched_matmul_type](
+            c_tensor_reshaped,
+            a_tensor_reshaped,
+            b_tensor_reshaped,
+            m,
+            n,
+            k,
+            grid_dim=(
+                ceildiv(n, block_n),
+                ceildiv(m, block_m),
+                batch_size,
+            ),
+            block_dim=(128, 1, 1),  # 4 warps per block for RDNA
+        )
     else:
         # TODO: support non-A100 transposed kernels
         constrained[
@@ -1130,8 +1163,8 @@ fn _bmm_sm100_blockwise_scaled_fp8_kernel[
     var M = c_tensor.dim(1)
     var N = c_tensor.dim(2)
 
-    var c_ptr = c_tensor.ptr + (block_idx.z * UInt(M) * UInt(N))
-    var b_scales_ptr = b_scales_tensor.ptr + (
+    var c_ptr = c_tensor.ptr + UInt(block_idx.z * UInt(M) * UInt(N))
+    var b_scales_ptr = b_scales_tensor.ptr + UInt(
         block_idx.z
         * UInt(b_scales_tensor.dim(1))
         * UInt(b_scales_tensor.dim(2))
@@ -1261,9 +1294,6 @@ fn bmm_sm100_blockwise_scaled_fp8[
     var M = c.dim(1)
     var N = c.dim(2)
     var K = a.dim(2)
-
-    if batch_size == 0 or M == 0 or N == 0 or K == 0:
-        return
 
     var a_scales_dim0 = a_scales.dim(1)
     var a_scales_dim1 = a_scales.dim(2)
