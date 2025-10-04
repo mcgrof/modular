@@ -43,6 +43,10 @@ _FILECHECK_TESTS = [
 _CONSTRAINTS = {
     "test_activations.mojo": ["@platforms//os:linux"],
     "test_top_k.mojo": ["@platforms//os:linux"],  # TODO: Fix on macOS
+    "test_mha_rdna_gpu.mojo": [
+        "//:has_gpu",
+        "//:amd_gpu",
+    ],  # Requires RDNA GPU
 }
 
 [
@@ -60,6 +64,22 @@ _CONSTRAINTS = {
     for src in _FILECHECK_TESTS
 ]
 
+# GPU-specific tests (require tags and specific constraints)
+mojo_test(
+    name = "test_mha_rdna_gpu.mojo.test",
+    srcs = ["test_mha_rdna_gpu.mojo"],
+    tags = ["gpu"],
+    target_compatible_with = [
+        "//:has_gpu",
+        "//:amd_gpu",
+    ],
+    deps = [
+        "@mojo//:internal_utils",
+        "@mojo//:nn",
+        "@mojo//:stdlib",
+    ],
+)
+
 [
     mojo_test(
         name = src + ".test",
@@ -74,6 +94,6 @@ _CONSTRAINTS = {
     )
     for src in glob(
         ["**/*.mojo"],
-        exclude = _FILECHECK_TESTS,
+        exclude = _FILECHECK_TESTS + ["test_mha_rdna_gpu.mojo"],
     )
 ]
