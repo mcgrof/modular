@@ -13,6 +13,7 @@
 
 from collections import OptionalReg
 from sys import align_of, simd_width_of
+from sys.info import _is_amd_rdna
 
 from gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
@@ -291,6 +292,16 @@ fn gemm_kernel_amd[
         a: Input matrix A.
         b: Input matrix B (must be transposed).
     """
+    # This kernel is optimized for CDNA GPUs (Wave64: gfx942, gfx950, etc.)
+    # RDNA GPUs (Wave32) use vendor library (rocBLAS) fallback instead
+    constrained[
+        not _is_amd_rdna(),
+        (
+            "AMD GEMM kernel requires CDNA (Wave64). RDNA uses vendor library"
+            " fallback."
+        ),
+    ]()
+
     # Validate input constraints
     constrained[transpose_b, "Transpose b must be true"]()
     constrained[a_type == b_type, "a and b must have same type"]()

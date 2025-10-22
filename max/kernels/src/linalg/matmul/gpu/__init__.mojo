@@ -21,7 +21,7 @@ from sys import (
     simd_width_of,
     size_of,
 )
-from sys.info import _accelerator_arch
+from sys.info import _accelerator_arch, _is_amd_rdna
 
 from algorithm.functional import elementwise, tile_and_unswitch
 from buffer.buffer import NDBuffer
@@ -571,86 +571,98 @@ fn _matmul_gpu[
 
             @parameter
             if has_amd_gpu_accelerator():
-
-                @always_inline
+                # RDNA GPUs (Wave32) use vendor library (rocBLAS) instead of
+                # CDNA-specific multistage GEMM kernels (Wave64).
+                # Skip to vendor library fallback for RDNA.
                 @parameter
-                fn kernel_helper[
-                    block_m: Int,
-                    block_n: Int,
-                    *,
-                    num_k_partitions: Int = 1,
-                    num_pipeline_stages: Int = 1,
-                ]() raises:
-                    alias config = MatmulConfig[
-                        a_type, b_type, c_type, transpose_b
-                    ](
-                        block_tile_shape=Index(
-                            block_m, block_n, _bk_base[a_type, True]()
-                        ),
-                        warp_tile_shape=Index(
-                            block_m // 2, block_n // 2, _bk_base[a_type, True]()
-                        ),
-                        mma_shape=_amdgpu_get_mma_shape[a_type, transpose_b](),
-                        num_pipeline_stages=UInt(num_pipeline_stages),
-                        num_k_partitions=UInt(num_k_partitions),
-                        pdl_level=pdl_level,
-                    )
-                    return _multistage_gemm[config]()
+                if not _is_amd_rdna():
+                    # CDNA-specific path (gfx942, gfx950, etc.)
 
-                @parameter
-                if not transpose_b:
-                    return kernel_helper[128, 128, num_pipeline_stages=2]()
-                elif env_get_bool["AUTOTUNING_MODE", False]():
-                    alias block_m = env_get_int["TUNE_BM", 128]()
-                    alias block_n = env_get_int["TUNE_BN", 128]()
-                    alias num_k_partitions = env_get_int[
-                        "TUNE_NUM_K_PARTITIONS", 1
-                    ]()
-                    return kernel_helper[
-                        block_m, block_n, num_k_partitions=num_k_partitions
-                    ]()
-
-                alias sm_count = Int(ctx.default_device_info.sm_count)
-                alias block_shape_list = _amdgpu_matmul_build_block_shape_list[
-                    static_N
-                ]()
-
-                # Auto-tune block shape selection: Find the configuration that minimizes
-                # SM idle time by scoring how evenly work distributes across all SMs.
-                # Lower score = better load balance (fewer idle SMs in the last wave).
-                var best_idx = 0
-                var best_score = Int.MAX
-
-                @parameter
-                for i in range(len(block_shape_list)):
-                    alias block_shape = block_shape_list[i]
-                    alias block_m = block_shape[0]
-                    alias block_n = block_shape[1]
-                    alias n_blocks = ceildiv(static_N, block_n)
-
-                    var m_blocks = ceildiv(m, block_m)
-                    var total_blocks = m_blocks * n_blocks
-                    var batch, extra = divmod(total_blocks - 1, sm_count)
-                    var score = batch * sm_count + (sm_count - extra - 1)
-
-                    if score < best_score:
-                        best_idx = i
-                        best_score = score
-
-                @parameter
-                for i in range(len(block_shape_list)):
-                    if best_idx == i:
-                        alias config = _amdgpu_matmul_config_from_block_shape[
-                            c_type,
-                            a_type,
-                            b_type,
-                            transpose_b,
-                            static_K,
-                            pdl_level,
-                        ](block_shape_list[i])
+                    @always_inline
+                    @parameter
+                    fn kernel_helper[
+                        block_m: Int,
+                        block_n: Int,
+                        *,
+                        num_k_partitions: Int = 1,
+                        num_pipeline_stages: Int = 1,
+                    ]() raises:
+                        alias config = MatmulConfig[
+                            a_type, b_type, c_type, transpose_b
+                        ](
+                            block_tile_shape=Index(
+                                block_m, block_n, _bk_base[a_type, True]()
+                            ),
+                            warp_tile_shape=Index(
+                                block_m // 2,
+                                block_n // 2,
+                                _bk_base[a_type, True](),
+                            ),
+                            mma_shape=_amdgpu_get_mma_shape[
+                                a_type, transpose_b
+                            ](),
+                            num_pipeline_stages=UInt(num_pipeline_stages),
+                            num_k_partitions=UInt(num_k_partitions),
+                            pdl_level=pdl_level,
+                        )
                         return _multistage_gemm[config]()
 
-                return kernel_helper[128, 128]()
+                    @parameter
+                    if not transpose_b:
+                        return kernel_helper[128, 128, num_pipeline_stages=2]()
+                    elif env_get_bool["AUTOTUNING_MODE", False]():
+                        alias block_m = env_get_int["TUNE_BM", 128]()
+                        alias block_n = env_get_int["TUNE_BN", 128]()
+                        alias num_k_partitions = env_get_int[
+                            "TUNE_NUM_K_PARTITIONS", 1
+                        ]()
+                        return kernel_helper[
+                            block_m, block_n, num_k_partitions=num_k_partitions
+                        ]()
+
+                    alias sm_count = Int(ctx.default_device_info.sm_count)
+                    alias block_shape_list = _amdgpu_matmul_build_block_shape_list[
+                        static_N
+                    ]()
+
+                    # Auto-tune block shape selection: Find the configuration that minimizes
+                    # SM idle time by scoring how evenly work distributes across all SMs.
+                    # Lower score = better load balance (fewer idle SMs in the last wave).
+                    var best_idx = 0
+                    var best_score = Int.MAX
+
+                    @parameter
+                    for i in range(len(block_shape_list)):
+                        alias block_shape = block_shape_list[i]
+                        alias block_m = block_shape[0]
+                        alias block_n = block_shape[1]
+                        alias n_blocks = ceildiv(static_N, block_n)
+
+                        var m_blocks = ceildiv(m, block_m)
+                        var total_blocks = m_blocks * n_blocks
+                        var batch, extra = divmod(total_blocks - 1, sm_count)
+                        var score = batch * sm_count + (sm_count - extra - 1)
+
+                        if score < best_score:
+                            best_idx = i
+                            best_score = score
+
+                    @parameter
+                    for i in range(len(block_shape_list)):
+                        if best_idx == i:
+                            alias config = _amdgpu_matmul_config_from_block_shape[
+                                c_type,
+                                a_type,
+                                b_type,
+                                transpose_b,
+                                static_K,
+                                pdl_level,
+                            ](
+                                block_shape_list[i]
+                            )
+                            return _multistage_gemm[config]()
+
+                    return kernel_helper[128, 128]()
 
             else:
 

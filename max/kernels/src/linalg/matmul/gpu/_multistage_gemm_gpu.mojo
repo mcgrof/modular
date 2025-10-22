@@ -20,6 +20,7 @@ from sys import (
     simd_width_of,
     size_of,
 )
+from sys.info import _is_amd_rdna
 
 import gpu.warp as warp
 from buffer import NDBuffer
@@ -1164,7 +1165,9 @@ fn multistage_gemm_split_k_kernel[
     )
 
     @parameter
-    if has_amd_gpu_accelerator() and transpose_b:
+    if has_amd_gpu_accelerator() and transpose_b and not _is_amd_rdna():
+        # CDNA-specific AMD kernel (Wave64)
+        # RDNA GPUs use vendor library fallback instead
         gemm_kernel_amd[
             work_space_type,
             work_space_part.layout,
