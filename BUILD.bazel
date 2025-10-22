@@ -197,6 +197,18 @@ platform(
     },
 )
 
+# Local W7900 platform for RDNA GPU testing (developer testing only)
+platform(
+    name = "w7900-platform",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        ":amd_gpu",
+        ":has_gpu",
+        ":W7900_gpu",
+    ],
+)
+
 string_flag(
     name = "modular_config",
     build_setting_default = "default",

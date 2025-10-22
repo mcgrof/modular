@@ -33,7 +33,7 @@ References:
 """
 
 from algorithm import max as algorithm_max, min as algorithm_min
-from collections import InlineArray
+from collections import InlineArray, OptionalReg
 from math import ceildiv, exp, log, recip, sqrt
 from math.constants import log2e
 from sys import llvm_intrinsic, size_of, simd_width_of
@@ -44,7 +44,11 @@ from gpu.memory import AddressSpace
 from gpu.mma import mma
 from gpu.warp import shuffle_down, shuffle_idx, sum as warp_sum
 from layout import Layout, LayoutTensor
+from layout.int_tuple import UNKNOWN_VALUE
 from memory import stack_allocation
+from nn.mha_mask import MHAMask
+from nn.mha_operand import MHAOperand
+from nn.mha_utils import MHAConfig
 from utils import Index, IndexList
 from utils.numerics import get_accum_type, min_or_neg_inf
 
@@ -1046,4 +1050,91 @@ fn rdna_flash_attention[
     # Call kernel (currently simplified)
     rdna_flash_attention_kernel_simple[dtype, head_dim_q, head_dim_v](
         q, k, v, o, seq_len_q, seq_len_k, scale
+    )
+
+
+fn mha_single_batch_rdna[
+    output_type: DType,
+    q_type: DType,
+    k_t: MHAOperand,
+    v_t: MHAOperand,
+    mask_t: MHAMask,
+    group: Int,
+    config: MHAConfig,
+    sink: Bool = False,
+    sink_type: DType = output_type,
+](
+    output: UnsafePointer[Scalar[output_type]],
+    q: UnsafePointer[Scalar[q_type]],
+    k: k_t,
+    v: v_t,
+    seq_len: Int,
+    num_keys: Int,
+    scale: Float32,
+    batch_idx: Int,
+    start_pos: Int,
+    mask: mask_t,
+    sink_weights: OptionalReg[
+        LayoutTensor[q_type, Layout.row_major(UNKNOWN_VALUE), MutableAnyOrigin]
+    ],
+):
+    """RDNA Flash Attention wrapper matching mha_single_batch interface.
+
+    This wrapper adapts the simplified rdna_flash_attention kernel to match
+    the standard MHA dispatch interface used by CDNA/NVIDIA implementations.
+
+    Current limitations (will be lifted in future iterations):
+    - No grouped query attention (group must be 1)
+    - No sink tokens (sink must be False)
+    - No attention masking yet
+    - K/V must be LayoutTensorMHAOperand (no KV-cache support yet)
+    - Input and output types must match
+    """
+    alias depth = config.depth
+    alias num_heads = config.num_heads
+
+    # Validate constraints for initial implementation
+    constrained[
+        group == 1,
+        "RDNA flash attention: group query attention not yet supported",
+    ]()
+    constrained[
+        sink == False, "RDNA flash attention: sink tokens not yet supported"
+    ]()
+    constrained[
+        output_type == q_type,
+        "RDNA flash attention: output_type must match q_type",
+    ]()
+    constrained[
+        k_t.dtype == q_type, "RDNA flash attention: K dtype must match Q dtype"
+    ]()
+    constrained[
+        v_t.dtype == q_type, "RDNA flash attention: V dtype must match Q dtype"
+    ]()
+    constrained[
+        output_type == DType.float16 or output_type == DType.bfloat16,
+        "RDNA flash attention: only FP16/BF16 supported",
+    ]()
+
+    # Extract K/V pointers from MHAOperand using the trait's block_paged_ptr method
+    # This works polymorphically for all MHAOperand implementations
+    var kv_head_idx = UInt32(block_idx.y // UInt(group))
+    var k_ptr = k.block_paged_ptr[0](
+        UInt32(batch_idx), UInt32(start_pos), kv_head_idx, 0
+    ).bitcast[Scalar[q_type]]()
+    var v_ptr = v.block_paged_ptr[0](
+        UInt32(batch_idx), UInt32(start_pos), kv_head_idx, 0
+    ).bitcast[Scalar[q_type]]()
+
+    # Call the simplified RDNA flash attention kernel
+    # Note: seq_len is query length, num_keys is key/value length
+    # We use q_type since the constraint ensures output_type == q_type
+    rdna_flash_attention[q_type, depth, depth](
+        q,
+        k_ptr,
+        v_ptr,
+        output.bitcast[Scalar[q_type]](),
+        seq_len,
+        num_keys,
+        scale,
     )
