@@ -130,7 +130,9 @@ ax2.axhline(
 )
 
 # Add value labels on bars
-for i, (bar, val) in enumerate(zip(bars2, mojo_values_unstructured, strict=False)):
+for i, (bar, val) in enumerate(
+    zip(bars2, mojo_values_unstructured, strict=False)
+):
     height = bar.get_height()
     speedup = val / mojo_values_unstructured[0]
     ax2.text(

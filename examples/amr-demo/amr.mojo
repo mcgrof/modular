@@ -27,6 +27,10 @@ from sys.intrinsics import prefetch, PrefetchOptions
 from math import sqrt
 from builtin._location import __call_location
 
+# GPU support
+from gpu import block_idx, thread_idx, block_dim
+from gpu.host import DeviceContext
+
 
 # Compile-time mesh type specialization - zero runtime overhead
 alias MeshType = Int
@@ -627,6 +631,253 @@ fn heat_diffusion_structured_tiled[
     temp_new.free()
 
 
+# ===----------------------------------------------------------------------=== #
+# GPU Kernels
+# ===----------------------------------------------------------------------=== #
+
+
+fn heat_diffusion_structured_gpu(
+    mut mesh: AMRMesh[STRUCTURED],
+    dt: Float32,
+    alpha: Float32,
+    ctx: DeviceContext,
+) raises:
+    """GPU-accelerated heat diffusion for structured mesh.
+
+    Demonstrates:
+    - GPU parallelism for massive performance gains
+    - Coalesced memory access from SoA layout
+    - Same algorithm as CPU, different execution model
+    - AMD RDNA/CDNA support via Mojo's portable GPU backend
+    """
+    var num_cells = mesh.num_cells
+
+    # Allocate device buffers
+    var temperatures_d = ctx.enqueue_create_buffer[DType.float32](num_cells)
+    var temp_new_d = ctx.enqueue_create_buffer[DType.float32](num_cells)
+    var cell_sizes_d = ctx.enqueue_create_buffer[DType.float32](num_cells)
+    var active_flags_d = ctx.enqueue_create_buffer[DType.int64](num_cells)
+
+    # Copy mesh data to GPU
+    ctx.enqueue_copy(temperatures_d, mesh.temperatures)
+    ctx.enqueue_copy(cell_sizes_d, mesh.cell_sizes)
+
+    # Convert Int flags to Scalar[DType.int64] for GPU
+    var active_flags_h = UnsafePointer[Scalar[DType.int64]].alloc(num_cells)
+    for i in range(num_cells):
+        active_flags_h[i] = Scalar[DType.int64](mesh.active_flags[i])
+    ctx.enqueue_copy(active_flags_d, active_flags_h)
+
+    # Get raw pointers for kernel
+    var temperatures_ptr = temperatures_d.unsafe_ptr()
+    var temp_new_ptr = temp_new_d.unsafe_ptr()
+    var cell_sizes_ptr = cell_sizes_d.unsafe_ptr()
+    var active_flags_ptr = active_flags_d.unsafe_ptr()
+    var nx = mesh.nx
+    var ny = mesh.ny
+
+    # GPU kernel for structured mesh
+    @parameter
+    @__copy_capture(
+        temperatures_ptr,
+        temp_new_ptr,
+        cell_sizes_ptr,
+        active_flags_ptr,
+        nx,
+        ny,
+        dt,
+        alpha,
+        num_cells,
+    )
+    fn diffusion_kernel():
+        var tid = Int(thread_idx.x + block_idx.x * block_dim.x)
+
+        if tid >= num_cells:
+            return
+
+        if active_flags_ptr[tid] == 0:
+            temp_new_ptr[tid] = temperatures_ptr[tid]
+            return
+
+        # Compute 2D indices
+        var i = tid % nx
+        var j = tid // nx
+
+        var temp_center = temperatures_ptr[tid]
+        var laplacian = Float32(0.0)
+        var neighbor_count = 0
+
+        # 5-point stencil with boundary checks
+        if i > 0:
+            laplacian += temperatures_ptr[tid - 1] - temp_center
+            neighbor_count += 1
+        if i < nx - 1:
+            laplacian += temperatures_ptr[tid + 1] - temp_center
+            neighbor_count += 1
+        if j > 0:
+            laplacian += temperatures_ptr[tid - nx] - temp_center
+            neighbor_count += 1
+        if j < ny - 1:
+            laplacian += temperatures_ptr[tid + nx] - temp_center
+            neighbor_count += 1
+
+        var dx2 = cell_sizes_ptr[tid] * cell_sizes_ptr[tid]
+        if neighbor_count > 0:
+            temp_new_ptr[tid] = temp_center + dt * alpha * laplacian / dx2
+        else:
+            temp_new_ptr[tid] = temp_center
+
+    # Launch kernel
+    alias kernel = diffusion_kernel
+    var block_size = 256
+    var grid_size = (num_cells + block_size - 1) // block_size
+    ctx.enqueue_function_checked[kernel, kernel](
+        grid_dim=grid_size,
+        block_dim=block_size,
+    )
+
+    # Copy result back to host
+    ctx.enqueue_copy(mesh.temperatures, temp_new_d)
+    ctx.synchronize()
+
+    # Cleanup
+    active_flags_h.free()
+    _ = temperatures_d
+    _ = temp_new_d
+    _ = cell_sizes_d
+    _ = active_flags_d
+
+
+fn heat_diffusion_unstructured_gpu(
+    mut mesh: AMRMesh[UNSTRUCTURED],
+    dt: Float32,
+    alpha: Float32,
+    ctx: DeviceContext,
+) raises:
+    """GPU-accelerated heat diffusion for unstructured mesh with CSR graph.
+
+    Demonstrates:
+    - GPU handling of irregular memory access patterns
+    - Double indirection (neighbor_offsets -> neighbor_ids -> temperatures)
+    - Coalesced access despite irregular connectivity
+    - Performance comparison vs CPU for indirect access
+    """
+    var num_cells = mesh.num_cells
+
+    # Allocate device buffers
+    var temperatures_d = ctx.enqueue_create_buffer[DType.float32](num_cells)
+    var temp_new_d = ctx.enqueue_create_buffer[DType.float32](num_cells)
+    var cell_sizes_d = ctx.enqueue_create_buffer[DType.float32](num_cells)
+    var active_flags_d = ctx.enqueue_create_buffer[DType.int64](num_cells)
+
+    # CSR graph data
+    var neighbor_offsets_d = ctx.enqueue_create_buffer[DType.int64](
+        num_cells + 1
+    )
+    var max_edges = mesh.capacity * 8
+    var neighbor_ids_d = ctx.enqueue_create_buffer[DType.int64](max_edges)
+
+    # Copy mesh data to GPU
+    ctx.enqueue_copy(temperatures_d, mesh.temperatures)
+    ctx.enqueue_copy(cell_sizes_d, mesh.cell_sizes)
+
+    # Convert Int arrays to Scalar[DType.int64] for GPU
+    var active_flags_h = UnsafePointer[Scalar[DType.int64]].alloc(num_cells)
+    var neighbor_offsets_h = UnsafePointer[Scalar[DType.int64]].alloc(
+        num_cells + 1
+    )
+    var neighbor_ids_h = UnsafePointer[Scalar[DType.int64]].alloc(max_edges)
+
+    for i in range(num_cells):
+        active_flags_h[i] = Scalar[DType.int64](mesh.active_flags[i])
+    for i in range(num_cells + 1):
+        neighbor_offsets_h[i] = Scalar[DType.int64](mesh.neighbor_offsets[i])
+
+    # Find actual edge count
+    var edge_count = Int(mesh.neighbor_offsets[num_cells])
+    for i in range(edge_count):
+        neighbor_ids_h[i] = Scalar[DType.int64](mesh.neighbor_ids[i])
+
+    ctx.enqueue_copy(active_flags_d, active_flags_h)
+    ctx.enqueue_copy(neighbor_offsets_d, neighbor_offsets_h)
+    ctx.enqueue_copy(neighbor_ids_d, neighbor_ids_h)
+
+    # Get raw pointers for kernel
+    var temperatures_ptr = temperatures_d.unsafe_ptr()
+    var temp_new_ptr = temp_new_d.unsafe_ptr()
+    var cell_sizes_ptr = cell_sizes_d.unsafe_ptr()
+    var active_flags_ptr = active_flags_d.unsafe_ptr()
+    var neighbor_offsets_ptr = neighbor_offsets_d.unsafe_ptr()
+    var neighbor_ids_ptr = neighbor_ids_d.unsafe_ptr()
+
+    # GPU kernel for unstructured mesh (CSR)
+    @parameter
+    @__copy_capture(
+        temperatures_ptr,
+        temp_new_ptr,
+        cell_sizes_ptr,
+        active_flags_ptr,
+        neighbor_offsets_ptr,
+        neighbor_ids_ptr,
+        dt,
+        alpha,
+        num_cells,
+    )
+    fn diffusion_kernel():
+        var tid = Int(thread_idx.x + block_idx.x * block_dim.x)
+
+        if tid >= num_cells:
+            return
+
+        if active_flags_ptr[tid] == 0:
+            temp_new_ptr[tid] = temperatures_ptr[tid]
+            return
+
+        var temp_center = temperatures_ptr[tid]
+        var laplacian = Float32(0.0)
+        var neighbor_count = 0
+
+        # Indirect access through CSR graph
+        var start = Int(neighbor_offsets_ptr[tid])
+        var end = Int(neighbor_offsets_ptr[tid + 1])
+
+        # Double indirection: neighbor_ids[k] -> temperatures[neighbor_id]
+        for k in range(start, end):
+            var nbr_id = Int(neighbor_ids_ptr[k])
+            laplacian += temperatures_ptr[nbr_id] - temp_center
+            neighbor_count += 1
+
+        var dx2 = cell_sizes_ptr[tid] * cell_sizes_ptr[tid]
+        if neighbor_count > 0:
+            temp_new_ptr[tid] = temp_center + dt * alpha * laplacian / dx2
+        else:
+            temp_new_ptr[tid] = temp_center
+
+    # Launch kernel
+    alias kernel = diffusion_kernel
+    var block_size = 256
+    var grid_size = (num_cells + block_size - 1) // block_size
+    ctx.enqueue_function_checked[kernel, kernel](
+        grid_dim=grid_size,
+        block_dim=block_size,
+    )
+
+    # Copy result back to host
+    ctx.enqueue_copy(mesh.temperatures, temp_new_d)
+    ctx.synchronize()
+
+    # Cleanup
+    active_flags_h.free()
+    neighbor_offsets_h.free()
+    neighbor_ids_h.free()
+    _ = temperatures_d
+    _ = temp_new_d
+    _ = cell_sizes_d
+    _ = active_flags_d
+    _ = neighbor_offsets_d
+    _ = neighbor_ids_d
+
+
 fn refine_cell[
     mesh_type: MeshType
 ](mut mesh: AMRMesh[mesh_type], cell_idx: Int, mut next_id: Int) -> Bool:
@@ -766,6 +1017,38 @@ fn benchmark_diffusion_structured_tiled(
     var start = perf_counter_ns()
     for _ in range(num_steps):
         heat_diffusion_structured_tiled(mesh, 0.0001, 1.0)
+    var end = perf_counter_ns()
+
+    return Float64(end - start) / 1e9
+
+
+fn benchmark_diffusion_structured_gpu(
+    num_steps: Int, nx: Int, ny: Int, ctx: DeviceContext
+) raises -> Float64:
+    """Benchmark GPU-accelerated structured mesh diffusion."""
+    var mesh = AMRMesh[STRUCTURED](nx * ny * 2, nx, ny)
+    initialize_uniform_mesh(mesh, nx, ny)
+    set_gaussian_initial_condition(mesh)
+
+    var start = perf_counter_ns()
+    for _ in range(num_steps):
+        heat_diffusion_structured_gpu(mesh, 0.0001, 1.0, ctx)
+    var end = perf_counter_ns()
+
+    return Float64(end - start) / 1e9
+
+
+fn benchmark_diffusion_unstructured_gpu(
+    num_steps: Int, nx: Int, ny: Int, ctx: DeviceContext
+) raises -> Float64:
+    """Benchmark GPU-accelerated unstructured mesh diffusion with CSR."""
+    var mesh = AMRMesh[UNSTRUCTURED](nx * ny * 2, nx, ny)
+    initialize_uniform_mesh(mesh, nx, ny)
+    set_gaussian_initial_condition(mesh)
+
+    var start = perf_counter_ns()
+    for _ in range(num_steps):
+        heat_diffusion_unstructured_gpu(mesh, 0.0001, 1.0, ctx)
     var end = perf_counter_ns()
 
     return Float64(end - start) / 1e9
@@ -963,6 +1246,87 @@ fn main():
     print("  that C++ can only access through compiler-specific intrinsics")
     print("  or inline assembly. These features are portable and composable.")
     print("=" * 70)
+
+    # GPU Benchmarks (if GPU available)
+    print("\n" + "=" * 70)
+    print("GPU Acceleration (AMD RDNA/CDNA + NVIDIA)")
+    print("=" * 70)
+
+    try:
+        var ctx = DeviceContext()
+        print("✓ GPU detected and initialized")
+        print("\n[7] STRUCTURED mesh (GPU)...")
+        var time_structured_gpu = benchmark_diffusion_structured_gpu(
+            BENCH_STEPS, BENCH_NX, BENCH_NY, ctx
+        )
+        var throughput_s_gpu = (
+            Float64(BENCH_NX * BENCH_NY * BENCH_STEPS)
+            / time_structured_gpu
+            / 1e6
+        )
+        print(
+            "    Time:",
+            time_structured_gpu,
+            "s | Throughput:",
+            throughput_s_gpu,
+            "Mcells/sec",
+        )
+
+        print("\n[8] UNSTRUCTURED mesh (GPU - CSR indirect access)...")
+        var time_unstructured_gpu = benchmark_diffusion_unstructured_gpu(
+            BENCH_STEPS, BENCH_NX, BENCH_NY, ctx
+        )
+        var throughput_u_gpu = (
+            Float64(BENCH_NX * BENCH_NY * BENCH_STEPS)
+            / time_unstructured_gpu
+            / 1e6
+        )
+        print(
+            "    Time:",
+            time_unstructured_gpu,
+            "s | Throughput:",
+            throughput_u_gpu,
+            "Mcells/sec",
+        )
+
+        # GPU vs CPU comparison
+        var gpu_speedup_structured = time_structured / time_structured_gpu
+        var gpu_speedup_unstructured = time_unstructured / time_unstructured_gpu
+        print("\n" + "=" * 70)
+        print("GPU Performance Analysis:")
+        print("=" * 70)
+        print("  Structured mesh:")
+        print("    CPU (auto-vec):   ", throughput_s, "Mcells/sec")
+        print("    CPU (tiled):      ", throughput_s_tiled, "Mcells/sec")
+        print(
+            "    GPU:              ",
+            throughput_s_gpu,
+            "Mcells/sec (",
+            gpu_speedup_structured,
+            "x vs CPU baseline)",
+        )
+        print("\n  Unstructured mesh (double-indirect CSR):")
+        print("    CPU (auto-vec):   ", throughput_u, "Mcells/sec")
+        print(
+            "    GPU:              ",
+            throughput_u_gpu,
+            "Mcells/sec (",
+            gpu_speedup_unstructured,
+            "x vs CPU baseline)",
+        )
+        print("\nKey Result:")
+        print(
+            "  GPU handles double-indirect CSR access with",
+            gpu_speedup_unstructured,
+            "x speedup",
+        )
+        print("  Same Mojo code for CPU and GPU - portable and composable!")
+        print("=" * 70)
+
+    except:
+        print("✗ No GPU available - skipping GPU benchmarks")
+        print("  (Requires AMD RDNA/CDNA or NVIDIA GPU with Mojo support)")
+        print("=" * 70)
 
     # Interactive demo with refinement
     print("\n" + "=" * 70)
