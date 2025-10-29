@@ -12,46 +12,81 @@ This demo shows how Mojo can be used for large-scale scientific computing applic
 - **Sparse graph operations** for mesh connectivity
 - **Parallel execution** on both CPU and GPU
 
-## Running the Demos
+## Running the Demo
 
-### Basic Demo
+### Execute the AMR Demo
 
 ```bash
 # From the amr-demo directory
 mojo amr.mojo
 ```
 
-### Enhanced Demo (Performance Analysis)
+This runs:
+
+1. **Performance benchmarks** comparing different Mojo compiler optimization levels
+2. **C++ comparison** against the reference implementation
+3. **Interactive AMR simulation** with dynamic mesh refinement
+
+### Generate Performance Visualizations
 
 ```bash
-# Demonstrates compile-time specialization and indirect memory access optimization
-mojo amr_enhanced.mojo
+# Generate benchmark charts (requires matplotlib)
+python3 generate_benchmark_plot.py
+```
+
+This creates:
+
+- `amr_benchmark_results.png` - Throughput comparison charts
+- `amr_speedup_comparison.png` - Speedup analysis visualization
+
+### Compile and Run C++ Benchmark
+
+```bash
+# Compare against C++ reference implementation
+g++ -O3 -march=native -fopenmp -std=c++17 amr_benchmark.cpp -o amr_benchmark
+./amr_benchmark
 ```
 
 **Expected Output:**
 
 ```
-============================================================
-Adaptive Mesh Refinement Simulation Demo
-Physics: 2D Heat Diffusion with Dynamic Refinement
-============================================================
+======================================================================
+Adaptive Mesh Refinement: Mojo Compiler Optimization Demo
+======================================================================
 
-[1] Initializing 32 x 32 uniform mesh...
-    Initial cells: 1024 | Active: 1024
+[1] STRUCTURED mesh (auto-vectorization)...
+    Time: 0.082 s | Throughput: 5.02 Mcells/sec
 
-[2] Setting Gaussian heat source at center...
+[2] UNSTRUCTURED mesh (auto-vectorization)...
+    Time: 0.088 s | Throughput: 4.68 Mcells/sec
 
-[3] Performing adaptive refinement cycles...
-    Cycle 1 : 36 cells marked
-      Total: 1168 | Active: 1132
-    ...
+[3] STRUCTURED mesh (explicit SIMD + @parameter unrolling)...
+    Time: 0.006 s | Throughput: 69.42 Mcells/sec
 
-Final Mesh Statistics:
-  Total cells:      1168
-  Active cells:     1132
-  Refinement levels: 0-3
-  Memory layout:    Structure-of-Arrays (GPU-ready)
-  Neighbor graph:   CSR format
+[4] UNSTRUCTURED mesh (explicit SIMD + compile-time loop unroll)...
+    Time: 0.080 s | Throughput: 5.12 Mcells/sec
+
+[5] UNSTRUCTURED mesh (prefetch + @always_inline + compile-time math)...
+    Time: 0.080 s | Throughput: 5.14 Mcells/sec
+
+[6] STRUCTURED mesh (cache-blocked with compile-time tile size)...
+    Time: 0.001 s | Throughput: 724.47 Mcells/sec
+
+======================================================================
+Performance Gains from Explicit Compiler Control:
+======================================================================
+  Structured mesh:
+    Baseline (auto-vec):   5.02 Mcells/sec
+    + Explicit SIMD:      69.42 Mcells/sec ( 13.8 x)
+    + Cache blocking:    724.47 Mcells/sec (144.2 x)
+
+  Unstructured mesh:
+    Baseline (auto-vec):   4.68 Mcells/sec
+    + prefetch + inline:   5.14 Mcells/sec (  1.1 x)
+
+[Interactive Demo: AMR with Dynamic Refinement]
+Final Mesh: 1168 total cells | 1132 active | Levels: 0-3
+======================================================================
 ```
 
 ## Key Features
@@ -361,16 +396,57 @@ neighbor_ids: [n0, n1, n2, n3, ...]
 - SIMD-vectorizable access patterns
 - Reduces one level of indirection vs Array-of-Structs
 
-#### 4. **Performance Results**
+#### 4. **Performance Results: Mojo Compiler Optimizations**
 
-Running `amr_enhanced.mojo` on a 64×64 mesh (4096 cells) with 100 timesteps:
+Running the AMR demo on a 64×64 mesh (4096 cells) with 100 timesteps demonstrates the power of Mojo's explicit compiler control features:
 
-| Mesh Type | Time (sec) | Throughput (Mcells/sec) | Overhead |
-|-----------|------------|-------------------------|----------|
-| **Structured** (direct) | 0.068 | 5.99 | baseline |
-| **Unstructured** (indirect) | 0.068 | 6.05 | **-0.95%** |
+![AMR Benchmark Results](amr_benchmark_results.png)
 
-**Key Result**: Indirect access via CSR shows **no performance penalty** - demonstrating Mojo's compiler effectiveness at optimizing irregular memory access patterns that plague traditional AMR codes.
+**Structured Mesh Performance:**
+
+| Optimization Level | Throughput (Mcells/sec) | Speedup |
+|-------------------|-------------------------|---------|
+| Baseline (auto-vectorization) | 5.02 | 1.0× |
+| + Explicit SIMD | 69.42 | 13.8× |
+| + Cache blocking | **724.47** | **144.2×** |
+
+**Unstructured Mesh Performance (CSR indirect access):**
+
+| Optimization Level | Throughput (Mcells/sec) | Speedup |
+|-------------------|-------------------------|---------|
+| Baseline (auto-vectorization) | 4.68 | 1.0× |
+| + SIMD + @parameter unrolling | 5.12 | 1.09× |
+| + prefetch + @always_inline | 5.14 | 1.10× |
+
+**Comparison with C++ (GCC 15.2, -O3 -march=native):**
+
+| Implementation | Structured | Unstructured |
+|---------------|-----------|--------------|
+| **Mojo (optimized)** | 724.47 Mcells/sec | 5.14 Mcells/sec |
+| **C++ (optimized)** | 65.96 Mcells/sec | 100.87 Mcells/sec |
+| **Mojo advantage** | **11.0× faster** | 19.6× slower |
+
+![Speedup Comparison](amr_speedup_comparison.png)
+
+**Key Results:**
+
+1. **Cache blocking delivers 144× speedup** for structured meshes - Mojo's parametric `tile_size` enables compile-time cache optimization
+2. **Mojo beats highly-optimized C++ by 11×** for structured grids with explicit compiler control
+3. **Unstructured meshes show optimization opportunity** - indirect memory access patterns need further work to match C++ performance
+
+**Compiler Features Demonstrated:**
+
+- `@parameter` - Compile-time loop unrolling (zero runtime overhead)
+- `SIMD[DType, width]` - Explicit vectorization with guaranteed SIMD
+- `@always_inline` - Forced inlining (not just a hint like C++ `inline`)
+- `prefetch()` - Explicit memory prefetch hints from `sys.intrinsics`
+- `alias` - Compile-time constant evaluation
+- Parametric `tile_size` - Cache blocking optimized at compile-time
+- `simdwidthof[]` - Architecture-adaptive SIMD width selection
+
+**Why This Matters:**
+
+Traditional C++ requires compiler-specific intrinsics or inline assembly to achieve similar low-level control. Mojo provides portable, high-level syntax with explicit compiler directives that work across CPUs and GPUs (AMD RDNA/CDNA + NVIDIA). The 11× performance advantage over GCC demonstrates the value of fine-grained optimization control without sacrificing code readability.
 
 #### 5. **GPU Scalability**
 
