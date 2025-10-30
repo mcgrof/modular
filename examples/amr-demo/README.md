@@ -36,8 +36,10 @@ python3 generate_benchmark_plot.py
 
 This creates:
 
-- `amr_benchmark_results.png` - Throughput comparison charts
-- `amr_speedup_comparison.png` - Speedup analysis visualization
+- `amr_benchmark_results.png` - CPU throughput comparison charts
+- `amr_speedup_comparison.png` - CPU speedup analysis visualization
+- `amr_gpu_performance.png` - GPU vs CPU performance comparison
+- `amr_complete_comparison.png` - Complete overview (CPU/GPU/C++)
 
 ### Compile and Run C++ Benchmark
 
@@ -427,6 +429,10 @@ neighbor_ids: [n0, n1, n2, n3, ...]
 Running the AMR demo on a 64×64 mesh (4096 cells) with 100 timesteps demonstrates the power of Mojo's explicit compiler control features:
 
 ![AMR Benchmark Results](amr_benchmark_results.png)
+
+![GPU Performance Comparison](amr_gpu_performance.png)
+
+![Complete Performance Overview](amr_complete_comparison.png)
 
 **Structured Mesh Performance:**
 
