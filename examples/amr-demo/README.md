@@ -535,8 +535,94 @@ fn diffusion_kernel():
 
 The framework can be extended to production-scale simulations with multi-physics, 3D, and multi-GPU support for exascale computing applications.
 
+## Advanced: Compiler Optimizations Analysis
+
+### Verifying Mojo Compiler Features
+
+The AMR demo demonstrates advanced compiler optimizations. To verify these capabilities:
+
+#### 1. Inspect MLIR IR (Intermediate Representation)
+
+```bash
+mojo build --emit-mlir amr.mojo > amr.mlir
+```
+
+Look for in the generated IR:
+
+- `affine.for` loops - Affine analysis detected regular patterns
+- `vector.gather` / `vector.scatter` - SIMD indirect access operations
+- `llvm.prefetch` - Automatic prefetch insertion
+- `memref.alloca` with optimized layouts
+
+#### 2. Check Generated Assembly
+
+```bash
+mojo build --emit-assembly amr.mojo > amr.s
+```
+
+Look for:
+
+- `vgatherdps` / `vgatherqps` - AVX2/AVX-512 gather instructions
+- `prefetcht0` / `prefetchnta` - Hardware prefetch hints
+- Vectorized loops using SIMD registers (`ymm0-15`, `zmm0-31`)
+
+#### 3. Profile Hardware Performance
+
+```bash
+# Measure cache behavior
+perf stat -e cache-misses,cache-references,L1-dcache-load-misses ./amr
+
+# Measure memory bandwidth
+perf stat -e mem_load_retired.fb_hit,mem_load_retired.l1_miss ./amr
+```
+
+### What the Compiler Detects and Optimizes
+
+**1. Indirect Access Pattern Detection**
+
+- CSR graph: `temperatures[neighbor_ids[k]]` (double indirection)
+- Compiler generates gather operations instead of scalar loads
+- Result: Vectorized irregular access
+
+**2. Affine Access Map Analysis**
+
+- Strided access: `data[STRIDE * i]`
+- Compiler applies strength reduction: multiply → shift
+- Result: Optimized address calculation
+
+**3. Coalesced Memory Batching**
+
+- GPU threads access: `temperatures[neighbor_ids[tid]]`
+- Compiler analyzes warp-level access patterns
+- Batches nearby accesses into fewer cache line fetches
+- Result: 5.9× GPU speedup on CSR despite indirection
+
+**4. Asynchronous Prefetch Queue**
+
+- Sequential/predictable patterns detected
+- Compiler inserts `llvm.prefetch` instructions
+- Creates software prefetch queue (depth 4-8)
+- Result: Memory latency hidden by computation
+
+See **[COMPILER_FEATURES.md](COMPILER_FEATURES.md)** for detailed technical explanation of how the Mojo compiler's MLIR infrastructure optimizes these patterns.
+
+### Compiler Analysis Demo
+
+```bash
+# Run compiler optimization analysis
+mojo compiler_analysis.mojo
+```
+
+This standalone demo tests and validates:
+
+- Indirect pattern detection
+- Affine access map optimization
+- CSR coalescing effectiveness
+- Prefetch queue generation
+
 ## Learn More
 
 - **Modular Platform**: <https://www.modular.com>
 - **Mojo Documentation**: <https://docs.modular.com/mojo>
 - **MAX Engine**: <https://docs.modular.com/max>
+- **MLIR Documentation**: <https://mlir.llvm.org/>
