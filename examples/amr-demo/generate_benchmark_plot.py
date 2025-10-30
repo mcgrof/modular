@@ -40,6 +40,12 @@ cpp_performance = {
     "Unstructured (CSR)": 100.87,
 }
 
+# GPU performance (AMD W7900 RDNA3)
+gpu_performance = {
+    "Structured": 28.67,
+    "Unstructured (CSR)": 26.66,
+}
+
 # Create figure with two subplots
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
@@ -337,3 +343,293 @@ print("✓ Generated: amr_speedup_comparison.png")
 print("\nBenchmark visualizations created successfully!")
 print("  - amr_benchmark_results.png (throughput comparison)")
 print("  - amr_speedup_comparison.png (speedup analysis)")
+
+# === Create GPU comparison plot ===
+fig3, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
+
+# === Plot 1: Structured Mesh - CPU vs GPU ===
+implementations = [
+    "CPU\nBaseline",
+    "CPU\nSIMD",
+    "CPU\nCache\nBlocking",
+    "GPU\nW7900",
+]
+structured_values = [
+    mojo_structured["Auto-vectorization"],
+    mojo_structured["Explicit SIMD"],
+    mojo_structured["Cache blocking"],
+    gpu_performance["Structured"],
+]
+colors_struct = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+
+bars1 = ax1.bar(
+    implementations,
+    structured_values,
+    color=colors_struct,
+    alpha=0.8,
+    edgecolor="black",
+    linewidth=1.5,
+)
+
+# Add C++ reference line
+ax1.axhline(
+    y=cpp_performance["Structured (direct)"],
+    color="purple",
+    linestyle=":",
+    linewidth=2.5,
+    alpha=0.7,
+    label=f"C++ -O3 ({cpp_performance['Structured (direct)']:.1f} Mcells/sec)",
+)
+
+# Add value labels
+for bar, val in zip(bars1, structured_values, strict=False):
+    height = bar.get_height()
+    speedup = val / mojo_structured["Auto-vectorization"]
+    ax1.text(
+        bar.get_x() + bar.get_width() / 2.0,
+        height + 20,
+        f"{val:.1f}\n({speedup:.1f}x)",
+        ha="center",
+        va="bottom",
+        fontsize=11,
+        fontweight="bold",
+    )
+
+ax1.set_ylabel("Throughput (Mcells/sec)", fontsize=13, fontweight="bold")
+ax1.set_title(
+    "Structured Mesh: CPU Optimizations vs GPU\n(64×64 grid, 100 timesteps)",
+    fontsize=14,
+    fontweight="bold",
+    pad=15,
+)
+ax1.legend(fontsize=11, loc="upper left")
+ax1.grid(axis="y", alpha=0.3, linestyle="--")
+ax1.set_ylim(0, 1000)
+
+# Add key insight
+ax1.annotate(
+    "GPU: 5.7x\nvs baseline",
+    xy=(3, gpu_performance["Structured"]),
+    xytext=(2.5, 150),
+    fontsize=11,
+    fontweight="bold",
+    color="darkred",
+    arrowprops=dict(arrowstyle="->", color="darkred", lw=2),
+)
+
+# === Plot 2: Unstructured Mesh - CPU vs GPU ===
+unstruct_impls = ["CPU\nBaseline", "CPU\nSIMD +\nprefetch", "GPU\nW7900"]
+unstructured_values = [
+    mojo_unstructured["Auto-vectorization"],
+    mojo_unstructured["prefetch + inline"],
+    gpu_performance["Unstructured (CSR)"],
+]
+colors_unstruct = ["#1f77b4", "#9467bd", "#d62728"]
+
+bars2 = ax2.bar(
+    unstruct_impls,
+    unstructured_values,
+    color=colors_unstruct,
+    alpha=0.8,
+    edgecolor="black",
+    linewidth=1.5,
+)
+
+# Add C++ reference line
+ax2.axhline(
+    y=cpp_performance["Unstructured (CSR)"],
+    color="purple",
+    linestyle=":",
+    linewidth=2.5,
+    alpha=0.7,
+    label=f"C++ -O3 ({cpp_performance['Unstructured (CSR)']:.1f} Mcells/sec)",
+)
+
+# Add value labels
+for bar, val in zip(bars2, unstructured_values, strict=False):
+    height = bar.get_height()
+    speedup = val / mojo_unstructured["Auto-vectorization"]
+    ax2.text(
+        bar.get_x() + bar.get_width() / 2.0,
+        height + 3,
+        f"{val:.1f}\n({speedup:.1f}x)",
+        ha="center",
+        va="bottom",
+        fontsize=11,
+        fontweight="bold",
+    )
+
+ax2.set_ylabel("Throughput (Mcells/sec)", fontsize=13, fontweight="bold")
+ax2.set_title(
+    "Unstructured Mesh (CSR): CPU vs GPU\nDouble-Indirect Memory Access",
+    fontsize=14,
+    fontweight="bold",
+    pad=15,
+)
+ax2.legend(fontsize=11, loc="upper right")
+ax2.grid(axis="y", alpha=0.3, linestyle="--")
+ax2.set_ylim(0, 120)
+
+# Add key insight
+ax2.annotate(
+    "GPU: 5.9x\nvs baseline\n(irregular access!)",
+    xy=(2, gpu_performance["Unstructured (CSR)"]),
+    xytext=(1.2, 70),
+    fontsize=11,
+    fontweight="bold",
+    color="darkred",
+    arrowprops=dict(arrowstyle="->", color="darkred", lw=2),
+)
+
+# Overall title
+fig3.suptitle(
+    "AMR on GPU: AMD Radeon W7900 (RDNA3) Performance",
+    fontsize=16,
+    fontweight="bold",
+    y=0.98,
+)
+
+# Add footer
+footer_text = (
+    "Key Result: GPU achieves 5.9× speedup on unstructured CSR despite double-indirect memory access • "
+    "Same Mojo code runs portably on AMD RDNA/CDNA and NVIDIA GPUs"
+)
+fig3.text(
+    0.5,
+    0.02,
+    footer_text,
+    ha="center",
+    fontsize=10,
+    style="italic",
+    wrap=True,
+    color="#555555",
+)
+
+plt.tight_layout(rect=[0, 0.04, 1, 0.96])
+plt.savefig("amr_gpu_performance.png", dpi=150, bbox_inches="tight")
+print("  - amr_gpu_performance.png (GPU vs CPU comparison)")
+
+# === Create comprehensive comparison plot ===
+fig4, ax = plt.subplots(figsize=(14, 8))
+
+# All implementations for comparison
+labels = [
+    "CPU\nBaseline",
+    "CPU\nSIMD",
+    "CPU\nCache\nBlock",
+    "GPU\nW7900",
+    "C++\nGCC -O3",
+]
+
+structured_all = [
+    mojo_structured["Auto-vectorization"],
+    mojo_structured["Explicit SIMD"],
+    mojo_structured["Cache blocking"],
+    gpu_performance["Structured"],
+    cpp_performance["Structured (direct)"],
+]
+
+unstructured_all = [
+    mojo_unstructured["Auto-vectorization"],
+    mojo_unstructured["prefetch + inline"],
+    None,  # No cache blocking for unstructured
+    gpu_performance["Unstructured (CSR)"],
+    cpp_performance["Unstructured (CSR)"],
+]
+
+x = np.arange(len(labels))
+width = 0.35
+
+bars1 = ax.bar(
+    x - width / 2,
+    structured_all,
+    width,
+    label="Structured (direct)",
+    color="#2ca02c",
+    alpha=0.8,
+    edgecolor="black",
+    linewidth=1.5,
+)
+bars2 = ax.bar(
+    x + width / 2,
+    [
+        unstructured_all[0],
+        unstructured_all[1],
+        0,
+        unstructured_all[3],
+        unstructured_all[4],
+    ],
+    width,
+    label="Unstructured (CSR indirect)",
+    color="#9467bd",
+    alpha=0.8,
+    edgecolor="black",
+    linewidth=1.5,
+)
+
+# Add value labels
+for i, bar in enumerate(bars1):
+    height = bar.get_height()
+    if height > 0:
+        ax.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            height + 20,
+            f"{height:.0f}",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+            fontweight="bold",
+        )
+
+for i, bar in enumerate(bars2):
+    height = bar.get_height()
+    if height > 0:
+        ax.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            height + 3,
+            f"{height:.1f}",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+            fontweight="bold",
+        )
+
+ax.set_ylabel("Throughput (Mcells/sec)", fontsize=13, fontweight="bold")
+ax.set_title(
+    "Complete AMR Performance Comparison\nMojo CPU Optimizations vs GPU (AMD W7900) vs C++",
+    fontsize=14,
+    fontweight="bold",
+    pad=15,
+)
+ax.set_xticks(x)
+ax.set_xticklabels(labels)
+ax.legend(fontsize=12, loc="upper left")
+ax.grid(axis="y", alpha=0.3, linestyle="--")
+ax.set_yscale("log")
+ax.set_ylim(1, 1000)
+
+# Add key insights text box
+textstr = (
+    "Key Results:\n"
+    "• CPU cache blocking: 180× speedup (900 Mcells/sec)\n"
+    "• GPU on CSR indirect: 5.9× speedup despite irregular access\n"
+    "• Mojo beats C++ by 11× with explicit control (structured)\n"
+    "• Same code runs on AMD RDNA, CDNA, and NVIDIA GPUs"
+)
+props = dict(boxstyle="round", facecolor="wheat", alpha=0.7)
+ax.text(
+    0.98,
+    0.97,
+    textstr,
+    transform=ax.transAxes,
+    fontsize=10,
+    verticalalignment="top",
+    horizontalalignment="right",
+    bbox=props,
+)
+
+plt.tight_layout()
+plt.savefig("amr_complete_comparison.png", dpi=150, bbox_inches="tight")
+print("  - amr_complete_comparison.png (complete performance overview)")
+
+print("\nAll GPU visualizations created successfully!")
