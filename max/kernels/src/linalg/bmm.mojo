@@ -679,9 +679,9 @@ fn batched_matmul_kernel_gpu[
     n: Int,
     k: Int,
 ):
-    var a_ptr = a_tensor.ptr + block_idx.z * UInt(m * k)
-    var b_ptr = b_tensor.ptr + block_idx.z * UInt(n * k)
-    var c_ptr = c_tensor.ptr + block_idx.z * UInt(m * n)
+    var a_ptr = a_tensor.ptr + UInt(block_idx.z * (UInt(m) * UInt(k)))
+    var b_ptr = b_tensor.ptr + UInt(block_idx.z * (UInt(n) * UInt(k)))
+    var c_ptr = c_tensor.ptr + UInt(block_idx.z * (UInt(m) * UInt(n)))
 
     alias static_n = b_tensor.shape[1]() if transpose_b else b_tensor.shape[2]()
     alias static_k = b_tensor.shape[2]() if transpose_b else b_tensor.shape[1]()
@@ -1213,8 +1213,8 @@ fn _bmm_sm100_blockwise_scaled_fp8_kernel[
     var M = c_tensor.dim(1)
     var N = c_tensor.dim(2)
 
-    var c_ptr = c_tensor.ptr + (block_idx.z * UInt(M) * UInt(N))
-    var b_scales_ptr = b_scales_tensor.ptr + (
+    var c_ptr = c_tensor.ptr + UInt(block_idx.z * UInt(M) * UInt(N))
+    var b_scales_ptr = b_scales_tensor.ptr + UInt(
         block_idx.z
         * UInt(b_scales_tensor.dim(1))
         * UInt(b_scales_tensor.dim(2))
