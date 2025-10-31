@@ -14,6 +14,7 @@
 from collections import OptionalReg
 from math import ceildiv
 from sys import has_amd_gpu_accelerator
+from sys.info import _is_amd_cdna
 
 from benchmark import Bench, Bencher, BenchId, BenchMetric, ThroughputMeasure
 from buffer import NDBuffer
@@ -352,13 +353,14 @@ fn bench_matmuls(mut m: Bench, ctx: DeviceContext) raises:
     # alias K10_WNITER = 1
     # alias K10_TN = 4
     # alias K10_TM = 4
-    # Settings for A6000
-    alias K10_NUM_THREADS = 256 if has_amd_gpu_accelerator() else 128
+    # Settings for A6000 (NVIDIA) and RDNA (both Wave32)
+    # CDNA uses different settings (Wave64)
+    alias K10_NUM_THREADS = 256 if _is_amd_cdna() else 128
     alias K10_BN = 128
-    alias K10_BM = 256 if has_amd_gpu_accelerator() else 128
+    alias K10_BM = 256 if _is_amd_cdna() else 128
     alias K10_BK = 16
     alias K10_WN = 64
-    alias K10_WM = 128 if has_amd_gpu_accelerator() else 64
+    alias K10_WM = 128 if _is_amd_cdna() else 64
     alias K10_WNITER = 4
     alias K10_TN = 4
     alias K10_TM = 8
