@@ -12,6 +12,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from math import align_down, ceildiv
+from sys.info import _is_amd_cdna
 
 from gpu import barrier, thread_idx
 from gpu.host import DeviceContext, get_gpu_target
@@ -248,8 +249,11 @@ def main():
         for width in [1, 2, 4, 8, 16]:
             test_buffer[DType.int8, width](ctx)
 
-        test_buffer_lds[DType.float32, 1](ctx)
-
+        # LDS buffer operations (load_to_lds) only supported on CDNA
         @parameter
-        if ctx.default_device_info is MI355X:
-            test_buffer_lds[DType.bfloat16, 8](ctx)
+        if _is_amd_cdna():
+            test_buffer_lds[DType.float32, 1](ctx)
+
+            @parameter
+            if ctx.default_device_info is MI355X:
+                test_buffer_lds[DType.bfloat16, 8](ctx)
