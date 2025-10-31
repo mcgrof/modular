@@ -2110,26 +2110,40 @@ fn test_load_b_tr(ctx: DeviceContext) raises:
 
 
 def main():
+    from sys.info import _is_amd_cdna
+
     with DeviceContext() as ctx:
-        test_load_and_mma_f32_f32_16x16x4(ctx)
-        test_load_and_mma_f32_f32_16x16x4_k_group_size_4(ctx)
-        test_load_and_mma_f32_f32_16x16x4_transpose(ctx)
-        test_load_and_mma_f32_f32_16x16x4_transpose_k_group_size_4(ctx)
+        # FP32×FP32 WMMA is only supported on CDNA, not RDNA
+        @parameter
+        if _is_amd_cdna():
+            test_load_and_mma_f32_f32_16x16x4(ctx)
+            test_load_and_mma_f32_f32_16x16x4_k_group_size_4(ctx)
+            test_load_and_mma_f32_f32_16x16x4_transpose(ctx)
+            test_load_and_mma_f32_f32_16x16x4_transpose_k_group_size_4(ctx)
+
+        # FP16/BF16 WMMA tests (supported on both RDNA and CDNA)
         test_load_and_mma_f32_bf16_16x16x16(ctx)
         test_load_and_mma_f32_bf16_16x16x16_k_group_size_4(ctx)
         test_load_and_mma_f32_bf16_16x16x16_transpose(ctx)
         test_load_and_mma_f32_bf16_16x16x16_transpose_k_group_size_4(ctx)
         test_load_and_mma_f32_f16_16x16x16(ctx)
         test_load_and_mma_f32_f16_16x16x16_transpose(ctx)
-        test_load_and_mma_f32_bf16_32x32x8(ctx)
-        test_load_and_mma_f32_bf16_32x32x8_transpose(ctx)
-        test_load_and_mma_f32_f16_32x32x8(ctx)
-        test_load_and_mma_f32_f16_32x32x8_transpose(ctx)
 
-        test_load_and_mma_f32_bf8_16x16x32(ctx)
-        test_load_and_mma_f32_bf8_16x16x32_transpose(ctx)
-        test_load_and_mma_f32_bf8_16x16x32_transpose_k_group_size_2(ctx)
-
+        # 32x32x8 shapes are CDNA-only
         @parameter
-        if DeviceContext.default_device_info >= MI355X:
-            test_load_b_tr(ctx)
+        if _is_amd_cdna():
+            test_load_and_mma_f32_bf16_32x32x8(ctx)
+            test_load_and_mma_f32_bf16_32x32x8_transpose(ctx)
+            test_load_and_mma_f32_f16_32x32x8(ctx)
+            test_load_and_mma_f32_f16_32x32x8_transpose(ctx)
+
+	    @parameter
+	    if DeviceContext.default_device_info >= MI355X:
+	        test_load_b_tr(ctx)
+
+        # FP8 WMMA is only supported on CDNA, not RDNA
+        @parameter
+        if _is_amd_cdna():
+            test_load_and_mma_f32_bf8_16x16x32(ctx)
+            test_load_and_mma_f32_bf8_16x16x32_transpose(ctx)
+            test_load_and_mma_f32_bf8_16x16x32_transpose_k_group_size_2(ctx)

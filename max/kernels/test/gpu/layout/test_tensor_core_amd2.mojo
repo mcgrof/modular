@@ -522,15 +522,26 @@ def test_load_f32_f32_16x16x4_ldmatrix(ctx: DeviceContext):
 
 
 def main():
+    from sys.info import _is_amd_cdna
+
     with DeviceContext() as ctx:
         test_load_and_mma_f32_f16_16x16x16(ctx)
         test_load_and_mma_f32_bf16_16x16x16(ctx)
-        test_load_and_mma_f32_f32_16x16x4(ctx)
-        test_write_f32_f32_16x16x4(ctx)
+
+        # FP32×FP32 WMMA is only supported on CDNA, not RDNA
+        @parameter
+        if _is_amd_cdna():
+            test_load_and_mma_f32_f32_16x16x4(ctx)
+            test_write_f32_f32_16x16x4(ctx)
+
         test_write_f32_f16_16x16x16(ctx)
         test_write_f32_bf16_16x16x16(ctx)
 
         # ldmatrix
         test_load_f32_f16_16x16x16_ldmatrix(ctx)
         test_load_f32_bf16_16x16x16_ldmatrix(ctx)
-        test_load_f32_f32_16x16x4_ldmatrix(ctx)
+
+        # FP32×FP32 ldmatrix is only supported on CDNA, not RDNA
+        @parameter
+        if _is_amd_cdna():
+            test_load_f32_f32_16x16x4_ldmatrix(ctx)
