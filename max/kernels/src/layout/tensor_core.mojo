@@ -102,6 +102,112 @@ fn num_matrix_reg[dim_1: Int, dim_2: Int]() -> Int:
     return (dim_1 * dim_2) // WARP_SIZE
 
 
+fn num_matrix_reg_a[mma_shape: IndexList[3]]() -> Int:
+    """Calculates the A matrix fragment size per thread for given MMA shape.
+
+    Uses shape pattern to determine fragment distribution:
+    - NVIDIA (16x8xK): Standard M*K/32
+    - RDNA (16x16xK, Wave32): K elements per thread (unique shapes: 16x16x4, 16x16x16)
+    - CDNA (MxNxK, Wave64): Standard M*K/64
+
+    Parameters:
+        mma_shape: The MMA operation shape [M, N, K].
+
+    Returns:
+        The number of A matrix registers needed per thread.
+    """
+    alias M = mma_shape[0]
+    alias N = mma_shape[1]
+    alias K = mma_shape[2]
+
+    @parameter
+    if N == 8:
+        # NVIDIA: 16x8xK shapes use warp_size=32
+        return (M * K) // 32
+    elif M == 16 and N == 16 and (K == 4 or K == 16):
+        # RDNA-specific shapes: 16x16x4 (FP32) and 16x16x16 (FP16/BF16)
+        # These shapes are unique to RDNA - each thread holds full K dimension
+        return K
+    elif M == 16 and N == 16 and K == 32:
+        # 16x16x32 could be RDNA or CDNA - use WARP_SIZE to distinguish
+        # RDNA (Wave32): Each thread holds full K
+        # CDNA (Wave64): K distributed across wave
+        return K if WARP_SIZE == 32 else (M * K) // max(WARP_SIZE, 64)
+    else:
+        # CDNA or other: M*K/warp_size
+        # Use max(WARP_SIZE, 64) to handle package build when WARP_SIZE=0
+        return (M * K) // max(WARP_SIZE, 64)
+
+
+fn num_matrix_reg_b[mma_shape: IndexList[3]]() -> Int:
+    """Calculates the B matrix fragment size per thread for given MMA shape.
+
+    Uses shape pattern to determine fragment distribution:
+    - NVIDIA (16x8xK): Standard K*N/32
+    - RDNA (16x16xK, Wave32): K elements per thread (unique shapes: 16x16x4, 16x16x16)
+    - CDNA (MxNxK, Wave64): Standard K*N/64
+
+    Parameters:
+        mma_shape: The MMA operation shape [M, N, K].
+
+    Returns:
+        The number of B matrix registers needed per thread.
+    """
+    alias M = mma_shape[0]
+    alias N = mma_shape[1]
+    alias K = mma_shape[2]
+
+    @parameter
+    if N == 8:
+        # NVIDIA: 16x8xK shapes use warp_size=32
+        return (K * N) // 32
+    elif M == 16 and N == 16 and (K == 4 or K == 16):
+        # RDNA-specific shapes: 16x16x4 (FP32) and 16x16x16 (FP16/BF16)
+        # These shapes are unique to RDNA - each thread holds full K dimension
+        return K
+    elif M == 16 and N == 16 and K == 32:
+        # 16x16x32 could be RDNA or CDNA - use WARP_SIZE to distinguish
+        # RDNA (Wave32): Each thread holds full K
+        # CDNA (Wave64): K distributed across wave
+        return K if WARP_SIZE == 32 else (K * N) // max(WARP_SIZE, 64)
+    else:
+        # CDNA or other: K*N/warp_size
+        # Use max(WARP_SIZE, 64) to handle package build when WARP_SIZE=0
+        return (K * N) // max(WARP_SIZE, 64)
+
+
+fn num_matrix_reg_c[mma_shape: IndexList[3]]() -> Int:
+    """Calculates the C/D matrix fragment size per thread for given MMA shape.
+
+    All architectures use: M*N/WARP_SIZE
+    - NVIDIA (16x8): 16*8/32 = 4
+    - RDNA (16x16): 16*16/32 = 8
+    - CDNA (16x16 or 32x32): M*N/64
+
+    Parameters:
+        mma_shape: The MMA operation shape [M, N, K].
+
+    Returns:
+        The number of C/D matrix registers needed per thread.
+    """
+    alias M = mma_shape[0]
+    alias N = mma_shape[1]
+
+    @parameter
+    if N == 8:
+        # NVIDIA: 16x8 output, warp_size=32
+        return (M * N) // 32
+    elif M == 16 and N == 16:
+        # 16x16 output: RDNA (Wave32) uses 32, CDNA (Wave64) uses 64
+        # For RDNA-specific shapes (K=4 or K=16), always use 32
+        # For shared shapes (K=32), use WARP_SIZE if available
+        alias K = mma_shape[2]
+        return (M * N) // 32 if (K == 4 or K == 16 or WARP_SIZE == 32) else (M * N) // max(WARP_SIZE, 64)
+    else:
+        # CDNA 32x32 or fallback
+        return (M * N) // max(WARP_SIZE, 64)
+
+
 # shapes
 alias shape_null = IndexList[3](0, 0, 0)
 alias shape_16x8x4 = IndexList[3](16, 8, 4)
@@ -135,7 +241,7 @@ fn _get_b_k_group_size[
 fn _get_a_reg_tile_layout[a: Layout, shape: IndexList[3]]() -> Layout:
     return Layout.col_major(
         1,
-        num_matrix_reg[shape[0], shape[2]]() * _get_a_k_group_size[a, shape](),
+        num_matrix_reg_a[shape]() * _get_a_k_group_size[a, shape](),
     )
 
 
@@ -143,7 +249,7 @@ fn _get_b_reg_tile_layout[
     b: Layout, shape: IndexList[3], transpose_b: Bool
 ]() -> Layout:
     return Layout.row_major(
-        num_matrix_reg[shape[2], shape[1]]()
+        num_matrix_reg_b[shape]()
         * _get_b_k_group_size[b, shape, transpose_b](),
         1,
     )
@@ -206,9 +312,12 @@ struct TensorCore[
     )
 
     # Operand register types.
-    alias a_reg_type = SIMD[in_type, num_matrix_reg[shape[0], shape[2]]()]
-    alias b_reg_type = SIMD[in_type, num_matrix_reg[shape[2], shape[1]]()]
-    alias c_reg_type = SIMD[out_type, num_matrix_reg[shape[0], shape[1]]()]
+    # RDNA WMMA has different per-thread fragment distribution than NVIDIA/CDNA:
+    # - RDNA: Each thread holds the full K dimension for A/B fragments
+    # - NVIDIA/CDNA: K dimension is distributed across threads
+    alias a_reg_type = SIMD[in_type, num_matrix_reg_a[shape]()]
+    alias b_reg_type = SIMD[in_type, num_matrix_reg_b[shape]()]
+    alias c_reg_type = SIMD[out_type, num_matrix_reg_c[shape]()]
 
     alias c_reg_tile_type = LayoutTensor[
         out_type,
@@ -243,19 +352,32 @@ struct TensorCore[
         """
 
         @parameter
-        if _out_type is DType.float32 and _in_type is DType.float32:
-            return List[IndexList[3]](shape_16x8x4, shape_16x8x8)
-        elif _out_type is DType.float32 and _in_type is DType.bfloat16:
-            return List[IndexList[3]](shape_16x8x8, shape_16x8x16)
-        elif _out_type is DType.float32 and _in_type is DType.float16:
-            return List[IndexList[3]](shape_16x8x8, shape_8x8x4)
-        elif _out_type is DType.float32 and (
-            _in_type is DType.float8_e4m3fn or _in_type is DType.float8_e5m2
-        ):
-            return List[IndexList[3]](shape_16x8x32)
+        if _is_amd_rdna():
+            # RDNA WMMA shapes (Wave32)
+            if _out_type is DType.float32 and _in_type is DType.float32:
+                return List[IndexList[3]](shape_16x16x4)
+            elif _out_type is DType.float32 and _in_type is DType.bfloat16:
+                return List[IndexList[3]](shape_16x16x16)
+            elif _out_type is DType.float32 and _in_type is DType.float16:
+                return List[IndexList[3]](shape_16x16x16)
+            else:
+                constrained[False, "No valid RDNA WMMA shape for these types"]()
+                return List[IndexList[3]](shape_null)
         else:
-            constrained[False, "No valid shape of mma"]()
-            return List[IndexList[3]](shape_null)
+            # NVIDIA/CDNA shapes (Wave64/Warp32)
+            if _out_type is DType.float32 and _in_type is DType.float32:
+                return List[IndexList[3]](shape_16x8x4, shape_16x8x8)
+            elif _out_type is DType.float32 and _in_type is DType.bfloat16:
+                return List[IndexList[3]](shape_16x8x8, shape_16x8x16)
+            elif _out_type is DType.float32 and _in_type is DType.float16:
+                return List[IndexList[3]](shape_16x8x8, shape_8x8x4)
+            elif _out_type is DType.float32 and (
+                _in_type is DType.float8_e4m3fn or _in_type is DType.float8_e5m2
+            ):
+                return List[IndexList[3]](shape_16x8x32)
+            else:
+                constrained[False, "No valid shape of mma"]()
+                return List[IndexList[3]](shape_null)
 
     # need always_inline, otherwise the stack allocated LayoutTensor will not be valid
 
@@ -310,7 +432,7 @@ struct TensorCore[
         alias mma_m = shape[0]
         alias mma_k = shape[2]
         var a_reg_tile = type_of(res).stack_allocation()
-        alias reg_per_thread = num_matrix_reg[mma_m, mma_k]()
+        alias reg_per_thread = num_matrix_reg_a[shape]()
         # for AMD we load k_group_size mma tiles at a time so that we can use 16B loads
         # For example, when loading 16x16 bfloat16 tile only 32 lanes will be active
         # when using 16B loads, so instead we load 16x32 tile in one go.
@@ -329,18 +451,31 @@ struct TensorCore[
             fp8_dtype,
             bf8_dtype,
         ):
-            constrained[
-                (reg_per_thread in (1, 2) and in_type is DType.float32)
-                or (
-                    reg_per_thread in (4, 8)
-                    and (in_type in (DType.bfloat16, DType.float16))
-                )
-                or (
-                    reg_per_thread in (8,)
-                    and (in_type in (fp8_dtype, bf8_dtype))
-                ),
-                "No valid mma shape to load matrix fragment",
-            ]()
+            @parameter
+            if _is_amd_rdna():
+                # RDNA WMMA: 16 elements per thread for FP16/BF16, 4 for FP32
+                constrained[
+                    (reg_per_thread == 4 and in_type is DType.float32)
+                    or (
+                        reg_per_thread == 16
+                        and (in_type in (DType.bfloat16, DType.float16))
+                    ),
+                    "No valid RDNA WMMA shape to load matrix fragment",
+                ]()
+            else:
+                # NVIDIA/CDNA
+                constrained[
+                    (reg_per_thread in (1, 2) and in_type is DType.float32)
+                    or (
+                        reg_per_thread in (4, 8)
+                        and (in_type in (DType.bfloat16, DType.float16))
+                    )
+                    or (
+                        reg_per_thread in (8,)
+                        and (in_type in (fp8_dtype, bf8_dtype))
+                    ),
+                    "No valid mma shape to load matrix fragment",
+                ]()
 
             alias simd_width = reg_per_thread * k_group_size
 
@@ -375,7 +510,7 @@ struct TensorCore[
         alias mma_m = shape[0]
         alias mma_k = shape[2]
         var a_reg_tile = type_of(res).stack_allocation()
-        alias reg_per_thread = num_matrix_reg[mma_m, mma_k]()
+        alias reg_per_thread = num_matrix_reg_a[shape]()
 
         alias warp_layout = Layout.row_major(8, 4)
 
@@ -393,18 +528,32 @@ struct TensorCore[
 
         @parameter
         if in_type is DType.float32:
-            constrained[
-                reg_per_thread in (2, 4),
-                "No valid mma shape to load matrix fragment a (float32)",
-            ]()
+            @parameter
+            if _is_amd_rdna():
+                constrained[
+                    reg_per_thread == 4,
+                    "No valid RDNA WMMA shape to load matrix fragment a (float32)",
+                ]()
+            else:
+                constrained[
+                    reg_per_thread in (2, 4),
+                    "No valid mma shape to load matrix fragment a (float32)",
+                ]()
             var a_reg_frags = a.distribute[warp_layout](lane_id())
             a_reg_tile.copy_from(a_reg_frags)
 
         elif in_type is DType.bfloat16 or in_type is DType.float16:
-            constrained[
-                reg_per_thread in (4, 8),
-                "No valid mma shape to load matrix fragment a (half-float)",
-            ]()
+            @parameter
+            if _is_amd_rdna():
+                constrained[
+                    reg_per_thread == 16,
+                    "No valid RDNA WMMA shape to load matrix fragment a (half-float)",
+                ]()
+            else:
+                constrained[
+                    reg_per_thread in (4, 8),
+                    "No valid mma shape to load matrix fragment a (half-float)",
+                ]()
             var a_reg_frags = a.vectorize[1, 2]().distribute[warp_layout](
                 lane_id()
             )
@@ -483,7 +632,7 @@ struct TensorCore[
         alias mma_n = shape[1]
         alias mma_k = shape[2]
         var b_reg_tile = type_of(res).stack_allocation()
-        alias reg_per_thread = num_matrix_reg[mma_k, mma_n]()
+        alias reg_per_thread = num_matrix_reg_b[shape]()
         alias k_group_size = _get_b_k_group_size[b.layout, shape, transpose_b]()
 
         alias fp8_dtype = get_amd_fp8_dtype()
@@ -501,18 +650,31 @@ struct TensorCore[
             fp8_dtype,
             bf8_dtype,
         ):
-            constrained[
-                (reg_per_thread in (1, 2) and in_type is DType.float32)
-                or (
-                    reg_per_thread in (4, 8)
-                    and (in_type in (DType.bfloat16, DType.float16))
-                )
-                or (
-                    reg_per_thread in (8,)
-                    and (in_type in (fp8_dtype, bf8_dtype))
-                ),
-                "No valid mma shape to load matrix fragment b",
-            ]()
+            @parameter
+            if _is_amd_rdna():
+                # RDNA WMMA: 16 elements per thread for FP16/BF16, 4 for FP32
+                constrained[
+                    (reg_per_thread == 4 and in_type is DType.float32)
+                    or (
+                        reg_per_thread == 16
+                        and (in_type in (DType.bfloat16, DType.float16))
+                    ),
+                    "No valid RDNA WMMA shape to load matrix fragment b",
+                ]()
+            else:
+                # NVIDIA/CDNA
+                constrained[
+                    (reg_per_thread in (1, 2) and in_type is DType.float32)
+                    or (
+                        reg_per_thread in (4, 8)
+                        and (in_type in (DType.bfloat16, DType.float16))
+                    )
+                    or (
+                        reg_per_thread in (8,)
+                        and (in_type in (fp8_dtype, bf8_dtype))
+                    ),
+                    "No valid mma shape to load matrix fragment b",
+                ]()
 
             alias simd_width = reg_per_thread * k_group_size
 
@@ -556,7 +718,7 @@ struct TensorCore[
         alias mma_n = shape[1]
         alias mma_k = shape[2]
         var b_reg_tile = type_of(res).stack_allocation()
-        alias reg_per_thread = num_matrix_reg[mma_k, mma_n]()
+        alias reg_per_thread = num_matrix_reg_b[shape]()
 
         alias warp_layout = Layout.row_major(
             8, 4
@@ -632,13 +794,13 @@ struct TensorCore[
         alias mma_n = shape[1]
         alias mma_k = shape[2]
         var c_reg_tile = type_of(res).stack_allocation()
-        alias reg_per_thread = num_matrix_reg[mma_m, mma_n]()
+        alias reg_per_thread = num_matrix_reg_c[shape]()
         alias warp_layout = Layout.row_major(mma_m // reg_per_thread, mma_n)
 
         @parameter
         if out_type is DType.float32:
             constrained[
-                reg_per_thread in (4, 16),
+                reg_per_thread in (4, 8, 16),
                 "No valid shape to load matrix fragment c",
             ]()
 
@@ -656,7 +818,7 @@ struct TensorCore[
         alias mma_n = shape[1]
         alias mma_k = shape[2]
         var c_reg_tile = type_of(res).stack_allocation()
-        alias reg_per_thread = num_matrix_reg[mma_m, mma_n]()
+        alias reg_per_thread = num_matrix_reg_c[shape]()
 
         @parameter
         if out_type is DType.float32:
@@ -704,7 +866,7 @@ struct TensorCore[
         ]()
         alias mma_m = shape[0]
         alias mma_n = shape[1]
-        alias reg_per_thread = num_matrix_reg[mma_m, mma_n]()
+        alias reg_per_thread = num_matrix_reg_c[shape]()
         alias warp_layout = Layout.row_major(mma_m // reg_per_thread, mma_n)
 
         @parameter
@@ -745,7 +907,7 @@ struct TensorCore[
         ]()
         alias mma_m = shape[0]
         alias mma_n = shape[1]
-        alias reg_per_thread = num_matrix_reg[mma_m, mma_n]()
+        alias reg_per_thread = num_matrix_reg_c[shape]()
 
         @parameter
         if out_type is DType.float32:
@@ -845,8 +1007,8 @@ struct TensorCore[
         alias num_frags = fragments.shape[0]()
         alias M = shape[0]
         alias K = shape[2]
-        alias k_group_size = fragments.element_layout.size() // num_matrix_reg[
-            M, K
+        alias k_group_size = fragments.element_layout.size() // num_matrix_reg_a[
+            shape
         ]()
 
         @parameter
@@ -950,8 +1112,8 @@ struct TensorCore[
         alias num_frags = fragments.shape[0]()
         alias N = shape[1]
         alias K = shape[2]
-        alias k_group_size = fragments.element_layout.size() // num_matrix_reg[
-            N, K
+        alias k_group_size = fragments.element_layout.size() // num_matrix_reg_b[
+            shape
         ]()
 
         @parameter
@@ -1478,14 +1640,27 @@ fn get_fragment_size[mma_shape: IndexList[3]]() -> IndexList[3]:
 
     Returns:
         An `IndexList[3]` containing the fragment sizes per thread for matrices
-        A, B, and C/D respectively, calculated as:
-        `[M*K/WARP_SIZE, N*K/WARP_SIZE, M*N/WARP_SIZE]`.
+        A, B, and C/D respectively.
+
+        For NVIDIA/CDNA: `[M*K/WARP_SIZE, N*K/WARP_SIZE, M*N/WARP_SIZE]`
+        For RDNA: Each thread holds full K dimension, so A and B get K elements.
     """
-    return IndexList[3](
-        mma_shape[0] * mma_shape[2] // WARP_SIZE,
-        mma_shape[1] * mma_shape[2] // WARP_SIZE,
-        mma_shape[0] * mma_shape[1] // WARP_SIZE,
-    )
+    @parameter
+    if _is_amd_rdna():
+        # RDNA WMMA: Each thread holds the full K dimension for A/B fragments
+        # For 16x16x16: A=16, B=16, C/D=8
+        return IndexList[3](
+            mma_shape[2],  # A: K elements per thread
+            mma_shape[2],  # B: K elements per thread
+            mma_shape[0] * mma_shape[1] // WARP_SIZE,  # C/D: M*N/WARP_SIZE
+        )
+    else:
+        # NVIDIA/CDNA: Standard distribution
+        return IndexList[3](
+            mma_shape[0] * mma_shape[2] // WARP_SIZE,
+            mma_shape[1] * mma_shape[2] // WARP_SIZE,
+            mma_shape[0] * mma_shape[1] // WARP_SIZE,
+        )
 
 
 @fieldwise_init
