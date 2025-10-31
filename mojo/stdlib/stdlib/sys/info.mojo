@@ -757,11 +757,12 @@ fn _has_amd_tensor_cores() -> Bool:
     """Returns True if the AMD GPU has MFMA / WMMA tensor core support.
 
     AMD CDNA GPUs (MI300X, MI355X) use v_mfma_* instructions for tensor cores.
+    AMD RDNA3+ GPUs have v_wmma_* instructions for tensor cores.
 
     Returns:
         True if the GPU is CDNA or RDNA3+ with tensor core support.
     """
-    return _is_amd_cdna()
+    return _is_amd_cdna() or _is_amd_rdna3() or _is_amd_rdna4()
 
 
 @always_inline("nodebug")
@@ -786,12 +787,12 @@ fn _has_gpu_tensor_cores() -> Bool:
     This is a vendor-agnostic check that returns True for:
     - NVIDIA GPUs with tensor cores (Volta/sm_70 and newer)
     - AMD CDNA GPUs with MFMA support (MI300X, MI355X)
+    - AMD RDNA3+ GPUs with WMMA support (W7900, RX 7000)
     - Apple M-series GPUs (M1/M2/M3/M4 with matrix operations)
 
     Returns False for:
     - NVIDIA Maxwell/Pascal (no tensor cores)
     - AMD RDNA1/RDNA2 (no WMMA support)
-    - AMD RDNA3+
 
     Returns:
         True if the GPU has working tensor core support.
