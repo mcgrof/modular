@@ -15,6 +15,7 @@ from math import ceildiv, isclose
 from os import abort
 from random import random_float64
 from sys import has_amd_gpu_accelerator, has_nvidia_gpu_accelerator
+from sys.info import _is_amd_cdna, _is_amd_rdna
 
 from gpu import WARP_SIZE, block_dim, global_idx, grid_dim
 from gpu.host import DeviceContext
@@ -188,7 +189,18 @@ def main():
             test_layout_mma[DType.float32, DType.float16, shape_1688, 16, 8, 8](
                 ctx, rtol=1e-01
             )
-        elif has_amd_gpu_accelerator():
+        elif _is_amd_rdna():
+            # RDNA only supports FP16/BF16 → FP32, not FP32 → FP32
+            alias shape_161616 = IndexList[3](16, 16, 16)
+
+            test_layout_mma[
+                DType.float32, DType.float16, shape_161616, 16, 16, 16
+            ](ctx, rtol=1e-01)
+            test_layout_mma[
+                DType.float32, DType.bfloat16, shape_161616, 16, 16, 16
+            ](ctx, rtol=1e-01)
+        elif _is_amd_cdna():
+            # CDNA supports FP16/BF16/FP32 → FP32
             alias shape_161616 = IndexList[3](16, 16, 16)
             alias shape_16164 = IndexList[3](16, 16, 4)
 
