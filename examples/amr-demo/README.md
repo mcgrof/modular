@@ -1,7 +1,19 @@
 # Adaptive Mesh Refinement (AMR) Demo
 
-This proof-of-concept demonstrates GPU-capable Adaptive Mesh Refinement for
+This proof-of-concept explores GPU-capable Adaptive Mesh Refinement for
 computational physics simulations using Mojo.
+
+## Provenance and scope
+
+This is an AI-assisted exploratory prototype directed by Luis Chamberlain to
+evaluate whether Mojo is a useful vehicle for expressing AMR-style structured
+and irregular memory-access kernels across CPU/GPU targets. The prototype is
+intended for performance-engineering exploration, generated-code review, and
+validation workflow design. It should not be treated as a production AMR
+framework or as evidence of hand-written C++ HPC expertise.
+
+See [Limitations](#limitations) and [Validation checklist](#validation-checklist)
+before drawing conclusions from any numbers in this document.
 
 ## Overview
 
@@ -49,7 +61,9 @@ g++ -O3 -march=native -fopenmp -std=c++17 amr_benchmark.cpp -o amr_benchmark
 ./amr_benchmark
 ```
 
-**Expected Output:**
+**Expected Output** (captured from a single run on an AMD W7900; the
+"AMD RDNA/CDNA + NVIDIA" banner printed by the program reflects the *intended*
+portability target — only the AMD path was actually executed):
 
 ```
 ======================================================================
@@ -311,13 +325,19 @@ This AMR framework is applicable to a wide range of high-performance scientific 
 
 ## Comparison to Existing AMR Frameworks
 
-| Feature | This Demo | Chombo | SAMRAI | AMReX |
+This table positions the *language/tooling characteristics* being explored
+against established, production-grade C++ AMR frameworks. It is **not** a
+feature-parity claim: Chombo, SAMRAI, and AMReX are mature, validated codebases
+and this prototype is not. "This prototype" columns describe what was attempted
+here, not equivalent capability.
+
+| Aspect | This prototype | Chombo | SAMRAI | AMReX |
 |---------|-----------|--------|--------|-------|
 | Language | Mojo | C++ | C++ | C++ |
-| GPU Support | ✅ (Ready) | Partial | Partial | ✅ |
-| AMD GPU | ✅ RDNA/CDNA | Limited | Limited | CUDA-focused |
+| GPU support | Single-source kernels, run on AMD only | Partial | Partial | Mature (CUDA-focused) |
+| AMD GPU | Run on W7900 (RDNA3) | Limited | Limited | Limited |
 | Python API | Native | Via wrappers | Via wrappers | Via wrappers |
-| Compile Time | Fast | Slow | Slow | Moderate |
+| Maturity | Exploratory prototype | Production | Production | Production |
 
 ## Code Structure
 
@@ -402,14 +422,16 @@ fn heat_diffusion_unstructured(mesh: AMRMesh[UNSTRUCTURED], ...) # Indirect via 
 - Specialized code paths for each mesh structure
 - Compiler optimizes each variant independently
 
-#### 2. **MLIR-Based Optimization**
+#### 2. **MLIR-Based Optimization (candidate, unverified here)**
 
-Mojo's MLIR infrastructure enables sophisticated optimizations:
+Mojo's MLIR infrastructure *can* enable optimizations such as the following.
+Whether they fire for this code has not been confirmed via emitted IR — see the
+[Validation checklist](#validation-checklist):
 
-- Advanced pointer alias analysis
-- Automatic prefetch insertion for indirect accesses
+- Pointer alias analysis
+- Prefetch insertion for indirect accesses
 - Loop optimization aware of memory access patterns
-- Better instruction scheduling around memory latency
+- Instruction scheduling around memory latency
 
 #### 3. **SoA Memory Layout**
 
@@ -426,7 +448,13 @@ neighbor_ids: [n0, n1, n2, n3, ...]
 
 #### 4. **Performance Results: Mojo Compiler Optimizations**
 
-Running the AMR demo on a 64×64 mesh (4096 cells) with 100 timesteps demonstrates the power of Mojo's explicit compiler control features:
+The numbers below come from a single run of the AMR demo on a 64×64 mesh (4096
+cells, small) with 100 timesteps, on one machine. They are **preliminary**:
+there is no warmup, no repetition/median, no scaling curve across mesh sizes,
+and kernel-only vs end-to-end timing is not separated. Read them as a rough
+illustration of Mojo's explicit compiler-control features, not as benchmark
+results. See the [Validation checklist](#validation-checklist) for what would be
+needed to make them trustworthy.
 
 ![AMR Benchmark Results](amr_benchmark_results.png)
 
@@ -460,16 +488,16 @@ Running the AMR demo on a 64×64 mesh (4096 cells) with 100 timesteps demonstrat
 
 ![Speedup Comparison](amr_speedup_comparison.png)
 
-**Key Results:**
+**Observations (preliminary, single run on one machine — no warmup, no repetition, no scaling curve; see [Limitations](#limitations)):**
 
-1. **Cache blocking delivers 144× speedup** for structured meshes - Mojo's parametric `tile_size` enables compile-time cache optimization
-2. **Mojo beats highly-optimized C++ by 11×** for structured grids with explicit compiler control
-3. **Unstructured meshes show optimization opportunity** - indirect memory access patterns need further work to match C++ performance
+1. **Cache blocking showed a large speedup** (~144× here) for structured meshes, using Mojo's parametric `tile_size`. The magnitude is sensitive to mesh size and machine and should be re-measured with proper methodology before being quoted.
+2. **Mojo was faster than this particular C++ build** (GCC 15.2 `-O3 -march=native`) for structured grids in this run. This is a comparison against one reference build for context, not a general "Mojo beats C++" claim.
+3. **Unstructured meshes were slower than the C++ reference** here — indirect memory access patterns need further work and measurement.
 
 **Compiler Features Demonstrated:**
 
 - `@parameter` - Compile-time loop unrolling (zero runtime overhead)
-- `SIMD[DType, width]` - Explicit vectorization with guaranteed SIMD
+- `SIMD[DType, width]` - Explicit vectorization via SIMD types (verify the lowering in emitted assembly)
 - `@always_inline` - Forced inlining (not just a hint like C++ `inline`)
 - `prefetch()` - Explicit memory prefetch hints from `sys.intrinsics`
 - `alias` - Compile-time constant evaluation
@@ -478,25 +506,27 @@ Running the AMR demo on a 64×64 mesh (4096 cells) with 100 timesteps demonstrat
 
 **Why This Matters:**
 
-Traditional C++ requires compiler-specific intrinsics or inline assembly to achieve similar low-level control. Mojo provides portable, high-level syntax with explicit compiler directives that work across CPUs and GPUs (AMD RDNA/CDNA + NVIDIA). The 11× performance advantage over GCC demonstrates the value of fine-grained optimization control without sacrificing code readability.
+Traditional C++ requires compiler-specific intrinsics or inline assembly to achieve similar low-level control. Mojo provides portable, high-level syntax with explicit compiler directives intended to work across CPUs and GPUs. In this prototype the GPU path was run only on AMD (W7900, RDNA3); the NVIDIA path is expected to work from the same source but has **not** been validated here. The measured throughput differences relative to the C++ reference are preliminary single-machine numbers (see [Limitations](#limitations)) and should not be read as a general performance claim.
 
 #### 5. **GPU Acceleration Results**
 
-The AMR demo includes working GPU kernels portable across AMD RDNA/CDNA and NVIDIA GPUs:
+The AMR demo includes GPU kernels written against Mojo's portable GPU API. They
+were exercised on AMD only; portability to NVIDIA is a design goal, not a
+validated result here.
 
-**GPU Performance (tested on AMD W7900, 64×64 grid, 100 timesteps):**
+**GPU results (single run on AMD W7900, RDNA3, 64×64 grid / 4096 cells, 100 timesteps; no warmup or repetition, see [Limitations](#limitations)):**
 
-| Mesh Type | CPU Baseline | CPU Best | GPU | GPU Speedup |
+| Mesh Type | CPU Baseline | CPU Best | GPU | GPU vs baseline |
 |-----------|-------------|----------|-----|-------------|
-| **Structured** | 5.01 Mcells/sec | 900.73 Mcells/sec | **28.67 Mcells/sec** | **5.7× vs baseline** |
-| **Unstructured (CSR)** | 4.49 Mcells/sec | 5.73 Mcells/sec | **26.66 Mcells/sec** | **5.9× vs baseline** |
+| **Structured** | 5.01 Mcells/sec | 900.73 Mcells/sec | 28.67 Mcells/sec | ~5.7× (preliminary) |
+| **Unstructured (CSR)** | 4.49 Mcells/sec | 5.73 Mcells/sec | 26.66 Mcells/sec | ~5.9× (preliminary) |
 
-**Key GPU Results:**
+**GPU observations (preliminary):**
 
-1. **Portable GPU code** - Same Mojo source runs on AMD RDNA/CDNA and NVIDIA GPUs
-2. **Double-indirect CSR access** - GPU achieves 5.9× speedup despite irregular memory patterns
-3. **Zero code duplication** - CPU and GPU kernels share the same algorithm logic
-4. **Production-ready** - Demonstrates Mojo's capability for real-world HPC workloads
+1. **Single-source kernels** - the same Mojo source compiled for CPU and GPU on this machine, with no AMD-specific code changes
+2. **Double-indirect CSR access** - the GPU run was faster than the CPU baseline on this small mesh despite irregular memory patterns; this needs scaling curves before it can be called a speedup
+3. **Low duplication** - CPU and GPU kernels share the same algorithm logic
+4. **Exploratory only** - this is a prototype for evaluation, not a production-ready HPC component
 
 **GPU Kernel Features:**
 
@@ -514,17 +544,17 @@ fn diffusion_kernel():
         laplacian += temperatures_ptr[nbr_id] - temp_center
 ```
 
-- **SoA layout**: Enables coalesced memory access across GPU threads
-- **Portable**: Works on AMD RDNA/CDNA and NVIDIA without code changes
-- **Efficient**: Massive parallelism hides latency from irregular access patterns
+- **SoA layout**: Intended to enable coalesced memory access across GPU threads (not yet confirmed via profiler)
+- **Single-source**: Same kernel source used for CPU and AMD GPU; NVIDIA not validated here
+- **Parallelism**: GPU parallelism is expected to help hide latency from irregular access patterns
 
 ### Why This Matters for HPC
 
 - **Memory overcommitment**: AMR typically has 10-100× more cells than fit in cache
 - **Irregular access**: Physics-driven refinement creates unpredictable memory patterns
-- **Performance predictability**: Mojo's explicit control avoids hidden costs
-- **Portability**: Single codebase for CPU and GPU (AMD RDNA/CDNA + NVIDIA)
-- **Compiler leverage**: MLIR infrastructure specifically designed for these optimizations
+- **Explicit control**: Mojo exposes SIMD, tiling, and prefetch directives at the source level
+- **Portability goal**: a single codebase targeting CPU and GPU (validated on CPU + AMD GPU; NVIDIA untested here)
+- **Compiler leverage**: MLIR-based infrastructure that may apply these optimizations (verify via emitted IR/assembly, see below)
 
 ### Additional Mojo Advantages
 
@@ -533,7 +563,10 @@ fn diffusion_kernel():
 - **Modern tooling**: Fast compilation times compared to traditional C++ HPC frameworks
 - **Metaprogramming**: Zero-cost abstractions via compile-time parameters
 
-The framework can be extended to production-scale simulations with multi-physics, 3D, and multi-GPU support for exascale computing applications.
+In principle the approach could be extended toward larger simulations with
+multi-physics, 3D, and multi-GPU support, but none of that is implemented or
+validated here — those are directions for future work, not capabilities of this
+prototype.
 
 ## Advanced: Compiler Optimizations Analysis
 
@@ -576,35 +609,41 @@ perf stat -e cache-misses,cache-references,L1-dcache-load-misses ./amr
 perf stat -e mem_load_retired.fb_hit,mem_load_retired.l1_miss ./amr
 ```
 
-### What the Compiler Detects and Optimizes
+### Compiler optimizations to look for (hypotheses to verify)
 
-**1. Indirect Access Pattern Detection**
+> **Important:** the items below are *candidate* optimizations that the source
+> patterns make possible. They have **not** been confirmed for this code by
+> inspecting emitted IR/assembly or hardware counters. Treat each as a
+> hypothesis to check with the commands above, not as a statement of what the
+> compiler did.
 
-- CSR graph: `temperatures[neighbor_ids[k]]` (double indirection)
-- Compiler generates gather operations instead of scalar loads
-- Result: Vectorized irregular access
+**1. Indirect access pattern (CSR gather)**
 
-**2. Affine Access Map Analysis**
+- Source: `temperatures[neighbor_ids[k]]` (double indirection)
+- *Possible* result: `vector.gather` instead of scalar loads
+- Verify: look for `vector.gather` in `--emit-mlir`, `vgather*` in assembly
 
-- Strided access: `data[STRIDE * i]`
-- Compiler applies strength reduction: multiply → shift
-- Result: Optimized address calculation
+**2. Affine access map analysis**
 
-**3. Coalesced Memory Batching**
+- Source: strided access `data[STRIDE * i]`
+- *Possible* result: strength reduction (multiply → shift), vectorization
+- Verify: inspect address calculation in emitted assembly
 
-- GPU threads access: `temperatures[neighbor_ids[tid]]`
-- Compiler analyzes warp-level access patterns
-- Batches nearby accesses into fewer cache line fetches
-- Result: 5.9× GPU speedup on CSR despite indirection
+**3. Coalesced memory batching (GPU)**
 
-**4. Asynchronous Prefetch Queue**
+- Source: `temperatures[neighbor_ids[tid]]` across a warp
+- *Possible* result: fewer cache-line fetches when indices cluster
+- Verify: GPU profiler memory-transaction counters; not measured here
 
-- Sequential/predictable patterns detected
-- Compiler inserts `llvm.prefetch` instructions
-- Creates software prefetch queue (depth 4-8)
-- Result: Memory latency hidden by computation
+**4. Software prefetch**
 
-See **[COMPILER_FEATURES.md](COMPILER_FEATURES.md)** for detailed technical explanation of how the Mojo compiler's MLIR infrastructure optimizes these patterns.
+- Source: sequential/predictable index patterns
+- *Possible* result: inserted `llvm.prefetch` instructions
+- Verify: grep for `llvm.prefetch` in IR / `prefetcht0` in assembly
+
+See **[COMPILER_FEATURES.md](COMPILER_FEATURES.md)** for a more detailed
+walkthrough of these candidate transformations, written in the same
+"verify before believing" spirit.
 
 ### Compiler Analysis Demo
 
@@ -613,12 +652,56 @@ See **[COMPILER_FEATURES.md](COMPILER_FEATURES.md)** for detailed technical expl
 mojo compiler_analysis.mojo
 ```
 
-This standalone demo tests and validates:
+This standalone demo illustrates (it does not, by itself, prove the compiler
+applied) the following ideas:
 
 - Indirect pattern detection
 - Affine access map optimization
 - CSR coalescing effectiveness
 - Prefetch queue generation
+
+To confirm any of these actually happen, inspect the emitted IR/assembly and
+hardware counters as described above.
+
+## Limitations
+
+- **AI-generated prototype.** This code and documentation were produced with AI
+  assistance and require human review before any claim here is relied upon.
+- **Small benchmark sizes.** Measurements use a 64×64 mesh (4096 cells). This is
+  too small to be representative; numbers may change substantially at larger
+  sizes and must be re-measured.
+- **Speedups are preliminary.** Reported speedups come from single runs without
+  warmup, repetition, medians, or scaling curves, and may not reproduce.
+- **C++ reference is for comparison only.** `amr_benchmark.cpp` exists to give a
+  rough point of reference on the same machine. It is not a tuned or
+  expert-written HPC implementation, and "Mojo vs C++" figures should not be
+  read as a general language comparison.
+- **GPU results are single-target.** GPU numbers were obtained only on an AMD
+  W7900 (RDNA3). Results must be reported per hardware target; do not merge AMD
+  and (untested) NVIDIA results.
+- **Compiler claims are unverified.** Statements about gather generation,
+  prefetch insertion, strength reduction, and coalescing are hypotheses based on
+  source patterns. They need IR/assembly/profiler evidence before being stated
+  as fact.
+
+## Validation checklist
+
+Before any performance or capability claim in this document is treated as real,
+the following should be done and recorded:
+
+- [ ] **Numerical parity** — verify the Mojo and reference (C++) implementations
+      produce matching results within a documented tolerance on identical inputs.
+- [ ] **Repeated runs with medians** — run each benchmark many times with warmup,
+      report median and spread rather than a single sample.
+- [ ] **Larger meshes and scaling curves** — measure across a range of mesh sizes
+      and plot throughput vs problem size, not just one small grid.
+- [ ] **Separate timings** — report kernel-only and end-to-end timings
+      separately so setup/transfer costs are not hidden.
+- [ ] **Profiler / hardware-counter evidence** — back any cache, coalescing, or
+      prefetch claim with counter data (e.g. `perf stat`, GPU profiler), and back
+      any compiler-transformation claim with emitted IR/assembly.
+- [ ] **AMD and NVIDIA runs** — if portability is claimed, actually run on both
+      AMD and NVIDIA hardware and report each separately.
 
 ## Learn More
 

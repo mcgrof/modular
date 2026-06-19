@@ -1,8 +1,17 @@
 # Mojo Compiler Advanced Features for AMR
 
-This document explains how the Mojo compiler's MLIR-based infrastructure
-optimizes the indirect memory access patterns in Adaptive Mesh Refinement
-simulations.
+> **Status: AI-assisted, unverified.** This document describes optimizations
+> that the Mojo/MLIR toolchain *can* apply to indirect memory-access patterns
+> and how they would appear in lowered IR. The specific transformations are
+> **not confirmed** for this demo's code — no emitted IR, assembly, or hardware
+> counters were captured to prove they fire. Read every "the compiler does X"
+> statement below as "the compiler may do X; here is how to check." The MLIR
+> snippets are illustrative pseudo-IR, not captured compiler output. See the
+> README's [Validation checklist](README.md#validation-checklist).
+
+This document walks through how the Mojo compiler's MLIR-based infrastructure
+*could* optimize the indirect memory access patterns in Adaptive Mesh Refinement
+simulations, and how to verify whether it actually does.
 
 ## 1. Indirect Pattern Detection in MLIR
 
@@ -237,62 +246,77 @@ Block 0, Threads 0-31 access:  temperatures[100], [104], [101], [105], ...
 - If scattered, may reorder computation or use shared memory
 - Inserts `gpu.barrier()` where needed for correctness
 
-## 7. Proof in AMR Demo Results
+## 7. Indicators in the AMR Demo Results
 
-### CPU Results
+These are preliminary single-run measurements (no warmup/repetition/scaling
+curves). They are *consistent with* the optimizations above but do not, on their
+own, prove the compiler applied any specific transformation — that requires
+IR/assembly/profiler evidence.
 
-- **Cache blocking: 180× speedup** - Compiler optimized tile size
-- **Explicit SIMD: 14× speedup** - Compiler used `SIMD[DType, width]`
-- **Prefetch benefit: 1.1× speedup** - Modest but measurable
+### CPU (preliminary)
 
-### GPU Results
+- **Cache blocking: large speedup (~144–180× across runs)** — uses a
+  compile-time `tile_size`; the exact figure is mesh- and machine-dependent
+- **Explicit SIMD: ~14× speedup** — uses `SIMD[DType, width]`
+- **Prefetch: ~1.1× speedup** — small and within noise; needs repetition to confirm
 
-- **CSR unstructured: 5.9× speedup** - Despite double indirection!
-- Same throughput as structured (26-28 Mcells/sec)
-- Proves GPU parallelism hides irregular access latency
+### GPU (preliminary, AMD W7900 only)
 
-### Key Insight
+- **CSR unstructured: faster than CPU baseline (~5.9× here)** despite double indirection
+- Roughly similar throughput to structured (26–28 Mcells/sec) on this small mesh
+- *Consistent with* GPU parallelism hiding irregular-access latency; not yet
+  isolated from other effects
 
-The compiler doesn't magically make irregular access "regular".
-Instead, it:
+### Working interpretation (to be verified)
 
-1. Detects the pattern
-2. Generates appropriate gather/scatter operations
-3. Inserts prefetch to hide latency
-4. On GPU, uses massive parallelism to mask memory stalls
+A plausible explanation is that the compiler, rather than making irregular
+access "regular", may:
+
+1. Detect the gather pattern
+2. Generate gather/scatter operations
+3. Insert prefetch to hide latency
+4. On GPU, rely on parallelism to mask memory stalls
+
+Each step is a hypothesis — confirm with emitted IR/assembly and profiler counters.
 
 ## 8. Comparison with Traditional Compilers
 
-### GCC/Clang
+> The contrasts below are general expectations plus single-run numbers from this
+> demo's specific C++ build (GCC 15.2, `-O3 -march=native`). They are not a
+> controlled language benchmark; treat the throughput figures as preliminary.
 
-- Limited indirect access optimization
-- Requires `#pragma omp simd` hints for gather
-- No automatic prefetch insertion for irregular patterns
-- Indirect CSR access: **100 Mcells/sec** (good but hand-optimized)
+### GCC/Clang (this demo's reference build)
 
-### Mojo/MLIR
+- Indirect-access auto-vectorization is limited in general
+- Often needs `#pragma omp simd` hints for gather
+- CSR access in this build: ~**100 Mcells/sec** (a hand-written reference)
 
-- Automatic indirect pattern detection
-- `SIMD[DType]` guarantees vectorization
-- Portable across AMD/NVIDIA GPUs
-- CSR on GPU: **27 Mcells/sec** with *zero* hand-optimization
-- CPU with explicit control: **900 Mcells/sec** (11× faster than C++)
+### Mojo/MLIR (this demo)
+
+- `SIMD[DType]` requests explicit vectorization at the source level
+- Single-source kernels, run here on AMD GPU (NVIDIA untested)
+- CSR on GPU: ~**27 Mcells/sec** in this run, without AMD-specific tuning
+- CPU structured with explicit tiling: ~**900 Mcells/sec** in this run (faster
+  than this particular C++ build on this machine — not a general claim)
 
 ## Summary
 
-The Mojo compiler's MLIR infrastructure provides:
+The Mojo compiler's MLIR infrastructure *can* provide (each item still needs
+IR/assembly/profiler confirmation for this code):
 
-1. ✅ **Indirect pattern detection** - via SSA and affine analysis
-2. ✅ **Affine access map optimization** - strength reduction, vectorization
-3. ✅ **Coalesced memory batching** - GPU warp analysis, cache line optimization
-4. ✅ **Async prefetch queues** - automatic `llvm.prefetch` insertion
+1. **Indirect pattern detection** — via SSA and affine analysis
+2. **Affine access map optimization** — strength reduction, vectorization
+3. **Coalesced memory batching** — GPU warp analysis, cache-line optimization
+4. **Prefetch insertion** — `llvm.prefetch` for predictable patterns
 
-These are not theoretical - the AMR demo proves them empirically:
+The AMR demo provides preliminary measurements *consistent with* these, but does
+not prove them on its own:
 
-- 180× CPU speedup from compiler optimizations
-- 6× GPU speedup on irregular CSR despite double indirection
-- Portable code across x86, ARM, AMD GPUs, NVIDIA GPUs
+- Large CPU speedup (~144–180× across runs) from source-level optimizations
+- GPU faster than CPU baseline on irregular CSR (~6× here) despite double indirection
+- Single-source kernels run on CPU and AMD GPU (x86 + RDNA3); ARM and NVIDIA untested here
 
-**The key difference**: Mojo exposes these optimizations explicitly
-(`@parameter`, `SIMD[DType]`, `prefetch()`) while keeping them composable and
-portable.
+**The notable point**: Mojo exposes these optimization levers explicitly
+(`@parameter`, `SIMD[DType]`, `prefetch()`) at the source level. Whether the
+compiler then applies the lowerings described above should be verified, not
+assumed.
